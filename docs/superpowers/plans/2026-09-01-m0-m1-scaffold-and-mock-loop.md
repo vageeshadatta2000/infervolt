@@ -219,17 +219,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="INFERVOLT_", env_file=".env", extra="ignore")
 
-    home: Path = Path.home() / ".infervolt"
+    home: Path = Field(default_factory=lambda: Path.home() / ".infervolt")
     anthropic_model: str = "claude-opus-5"
     openai_base_url: str = "http://localhost:8000/v1"
     openai_model: str = "default"
-    openai_api_key: str = "EMPTY"
+    openai_api_key: SecretStr = SecretStr("EMPTY")
     llm_cassette: Path | None = None
 
     @property
@@ -393,14 +394,17 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'infervolt.core'`.
 
 `src/infervolt/core/types.py`:
 ```python
-"""All shared data models. Everything else imports from here; this module imports nothing internal."""
+"""All shared data models.
+
+Everything else imports from here; this module imports nothing internal.
+"""
 
 from __future__ import annotations
 
 import json
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 KnobValue = int | float | str | bool
 
@@ -427,22 +431,37 @@ class Workload(BaseModel):
 
 
 class SLO(BaseModel):
+    """Latency targets plus how strictly they must hold.
+
+    ``percentile`` applies to the per-request inter-token-latency distribution *only*:
+    a request passes ``itl_ms`` when the ``percentile`` quantile of its own ITLs is
+    under the target (0.9 means that request's p90 ITL). ``ttft_ms`` and ``e2e_ms``
+    have no distribution to summarise -- each request has one of each -- so they are
+    compared per request, directly. ``goodput_target`` is a different axis again: the
+    fraction of requests that must meet the SLO for the run to count as "SLO met".
+    """
+
     ttft_ms: float | None = None
     itl_ms: float | None = None
     e2e_ms: float | None = None
-    percentile: float = 0.9
+    percentile: float = Field(default=0.9, gt=0, le=1)
+    goodput_target: float = Field(default=0.9, gt=0, le=1)
 
 
 class HardwareProfile(BaseModel):
     name: str
     gpu: str
     count: int = 1
-    mem_gb: float
+    mem_gb: float = Field(description="Device memory in GiB, as reported by NVML.")
     hbm_bw_gbs: float
     peak_tflops: float
     compute_capability: float
     interconnect: Literal["single", "nvlink", "pcie"] = "single"
-    usd_per_hour: float = 0.0
+    usd_per_hour: float = Field(
+        default=0.0,
+        description="Rental price of a single GPU, in USD per hour; multiply by 'count' "
+        "for the price of the whole node.",
+    )
 
 
 class ModelInfo(BaseModel):
@@ -467,11 +486,46 @@ class Knob(BaseModel):
     kind: Literal["int", "float", "cat", "bool"]
     groups: list[str]
     default: KnobValue
-    low: float | None = None
-    high: float | None = None
-    step: float | None = None
+    low: int | float | None = None
+    high: int | float | None = None
+    step: int | float | None = None
     log: bool = False
     choices: list[KnobValue] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_kind_consistency(self) -> Knob:
+        if self.kind == "cat":
+            if not self.choices:
+                raise ValueError(f"knob {self.name!r}: kind 'cat' requires a non-empty 'choices'")
+            if self.default not in self.choices:
+                raise ValueError(
+                    f"knob {self.name!r}: default {self.default!r} is not in choices "
+                    f"{self.choices!r}"
+                )
+        elif self.kind in ("int", "float"):
+            if self.low is None or self.high is None:
+                raise ValueError(
+                    f"knob {self.name!r}: kind {self.kind!r} requires both 'low' and 'high'"
+                )
+            if self.low > self.high:
+                raise ValueError(
+                    f"knob {self.name!r}: low {self.low!r} must be <= high {self.high!r}"
+                )
+            if isinstance(self.default, (str, bool)):
+                raise ValueError(
+                    f"knob {self.name!r}: kind {self.kind!r} requires a numeric default, "
+                    f"got {self.default!r}"
+                )
+            if not self.low <= self.default <= self.high:
+                raise ValueError(
+                    f"knob {self.name!r}: default {self.default!r} is outside "
+                    f"[{self.low!r}, {self.high!r}]"
+                )
+        elif self.kind == "bool" and not isinstance(self.default, bool):
+            raise ValueError(
+                f"knob {self.name!r}: kind 'bool' requires a bool default, got {self.default!r}"
+            )
+        return self
 
 
 class KnobSpace(BaseModel):
@@ -517,11 +571,19 @@ class EngineConfig(BaseModel):
 
 
 class RequestRecord(BaseModel):
+    """One request's timing.
+
+    Invariant: ``len(itl_s) == output_tokens`` -- one inter-token latency per generated
+    token. ``ttft_s`` covers the first token (time from request start to its arrival),
+    so ``e2e_s`` is ``ttft_s`` plus the whole of ``itl_s``.
+    """
+
     ttft_s: float
     itl_s: list[float]
     output_tokens: int
     ok: bool = True
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def e2e_s(self) -> float:
         return self.ttft_s + sum(self.itl_s)
@@ -535,7 +597,9 @@ class ClientHealth(BaseModel):
 
 class LoadResult(BaseModel):
     concurrency: int
-    duration_s: float
+    duration_s: float = Field(
+        gt=0, description="Wall-clock seconds the load phase ran; every rate divides by it."
+    )
     requests: list[RequestRecord]
     health: ClientHealth = Field(default_factory=ClientHealth)
 
@@ -555,7 +619,10 @@ class Metrics(BaseModel):
     goodput_frac: float
     error_rate: float
     tokens_per_s_per_gpu: float
-    usd_per_m_tokens: float
+    usd_per_m_tokens: float = Field(
+        description="USD per million *output* tokens (input tokens are not counted); "
+        "infinite when the run produced no output tokens."
+    )
 
 
 class Evidence(BaseModel):
@@ -588,7 +655,7 @@ Bottleneck = Literal[
     "client_artifact",
 ]
 
-BOTTLENECK_PRIORITY: dict[str, int] = {
+BOTTLENECK_PRIORITY: dict[Bottleneck, int] = {
     "client_artifact": 0,
     "kv_capacity": 1,
     "prefill_compute": 2,
@@ -799,7 +866,10 @@ Expected: FAIL with `ModuleNotFoundError`.
 
 `src/infervolt/hardware/profiles.py`:
 ```python
-"""Named hardware profiles. Peak numbers are dense BF16 TFLOPs and HBM bandwidth from vendor specs."""
+"""Named hardware profiles.
+
+Peak numbers are dense BF16 TFLOPs and HBM bandwidth from vendor specs.
+"""
 
 from __future__ import annotations
 
@@ -807,30 +877,59 @@ from infervolt.core.types import HardwareProfile
 
 PROFILES: dict[str, HardwareProfile] = {
     "a100-80": HardwareProfile(
-        name="a100-80", gpu="NVIDIA A100-SXM4-80GB", mem_gb=80, hbm_bw_gbs=2039,
-        peak_tflops=312, compute_capability=8.0, usd_per_hour=1.5,
+        name="a100-80",
+        gpu="NVIDIA A100-SXM4-80GB",
+        mem_gb=80,
+        hbm_bw_gbs=2039,
+        peak_tflops=312,
+        compute_capability=8.0,
+        usd_per_hour=1.5,
     ),
     "h100-80": HardwareProfile(
-        name="h100-80", gpu="NVIDIA H100 80GB HBM3", mem_gb=80, hbm_bw_gbs=3350,
-        peak_tflops=989, compute_capability=9.0, usd_per_hour=3.0,
+        name="h100-80",
+        gpu="NVIDIA H100 80GB HBM3",
+        mem_gb=80,
+        hbm_bw_gbs=3350,
+        peak_tflops=989,
+        compute_capability=9.0,
+        usd_per_hour=3.0,
     ),
     "rtx4090-24": HardwareProfile(
-        name="rtx4090-24", gpu="NVIDIA GeForce RTX 4090", mem_gb=24, hbm_bw_gbs=1008,
-        peak_tflops=165, compute_capability=8.9, usd_per_hour=0.5,
+        name="rtx4090-24",
+        gpu="NVIDIA GeForce RTX 4090",
+        mem_gb=24,
+        hbm_bw_gbs=1008,
+        peak_tflops=165,
+        compute_capability=8.9,
+        usd_per_hour=0.5,
     ),
     "l4-24": HardwareProfile(
-        name="l4-24", gpu="NVIDIA L4", mem_gb=24, hbm_bw_gbs=300,
-        peak_tflops=121, compute_capability=8.9, usd_per_hour=0.6,
+        name="l4-24",
+        gpu="NVIDIA L4",
+        mem_gb=24,
+        hbm_bw_gbs=300,
+        peak_tflops=121,
+        compute_capability=8.9,
+        usd_per_hour=0.6,
     ),
     "m3-8": HardwareProfile(
-        name="m3-8", gpu="Apple M3 (10-core GPU)", mem_gb=8, hbm_bw_gbs=100,
-        peak_tflops=3.5, compute_capability=0.0, usd_per_hour=0.0,
+        name="m3-8",
+        gpu="Apple M3 (10-core GPU)",
+        mem_gb=8,
+        hbm_bw_gbs=100,
+        peak_tflops=3.5,
+        compute_capability=0.0,
+        usd_per_hour=0.0,
     ),
 }
 
 
 def get_profile(name: str) -> HardwareProfile:
-    return PROFILES[name]
+    """Return a private copy, so callers can adapt a profile without editing the registry."""
+    try:
+        return PROFILES[name].model_copy(deep=True)
+    except KeyError as e:
+        raise KeyError(f"unknown hardware profile {name!r}; known: {sorted(PROFILES)}") from e
 ```
 
 `src/infervolt/hardware/roofline.py`:
@@ -838,7 +937,18 @@ def get_profile(name: str) -> HardwareProfile:
 """Roofline estimates for LLM inference. All functions are pure and unit-tested.
 
 Decode is memory-bound: each step streams every weight byte plus the KV cache of every
-sequence in the batch through HBM. Prefill is compute-bound: 2 FLOPs per parameter per token.
+sequence in the batch through HBM. Prefill mixes a compute term (linear layers, quadratic
+attention) with the same weight stream, and takes whichever dominates.
+
+Two conventions hold throughout:
+
+* **Memory is GiB, not GB.** ``HardwareProfile.mem_gb`` is what NVML and the engines
+  report -- binary gibibytes -- so byte counts go through :func:`mem_bytes` and
+  :func:`reserve_bytes` (``* 2**30``). Model and bandwidth figures stay decimal
+  (``params_b * 1e9``, ``hbm_bw_gbs * 1e9``) because that is how they are specified.
+* **Every figure is per GPU, i.e. per tensor-parallel shard.** Nothing here knows about
+  TP: a caller modelling TP=4 must pass the per-shard model dimensions (divide layers'
+  widths, KV heads and parameters itself) before calling.
 """
 
 from __future__ import annotations
@@ -848,35 +958,75 @@ from infervolt.core.types import HardwareProfile, ModelInfo
 ACTIVATION_RESERVE_GB = 2.0
 
 
+def mem_bytes(hw: HardwareProfile) -> float:
+    """Total device memory in bytes. ``mem_gb`` is GiB, as NVML reports it."""
+    return hw.mem_gb * 2**30
+
+
+def reserve_bytes() -> float:
+    """Bytes held back for activations and fragmentation, i.e. not available for KV."""
+    return ACTIVATION_RESERVE_GB * 2**30
+
+
 def weight_bytes(m: ModelInfo) -> float:
     return m.params_b * 1e9 * m.weight_bits / 8
 
 
 def active_params(m: ModelInfo) -> float:
-    return (m.active_params_b or m.params_b) * 1e9
+    """Parameters touched per token: the MoE active count when declared, else all of them."""
+    b = m.active_params_b if m.active_params_b is not None else m.params_b
+    return b * 1e9
 
 
 def kv_bytes_per_token(m: ModelInfo, kv_dtype_bytes: int = 2) -> float:
+    if kv_dtype_bytes <= 0:
+        raise ValueError(f"kv_dtype_bytes must be positive, got {kv_dtype_bytes!r}")
     return 2.0 * m.num_layers * m.num_kv_heads * m.head_dim * kv_dtype_bytes
 
 
 def decode_step_floor_s(
     hw: HardwareProfile, m: ModelInfo, batch: int, ctx_tokens: int, kv_dtype_bytes: int = 2
 ) -> float:
-    mem_bytes = weight_bytes(m) + batch * kv_bytes_per_token(m, kv_dtype_bytes) * ctx_tokens
-    t_mem = mem_bytes / (hw.hbm_bw_gbs * 1e9)
+    if batch <= 0:
+        raise ValueError(f"batch must be positive, got {batch!r}")
+    streamed = weight_bytes(m) + batch * kv_bytes_per_token(m, kv_dtype_bytes) * ctx_tokens
+    t_mem = streamed / (hw.hbm_bw_gbs * 1e9)
     t_compute = 2.0 * active_params(m) * batch / (hw.peak_tflops * 1e12)
     return max(t_mem, t_compute)
 
 
 def prefill_floor_s(hw: HardwareProfile, m: ModelInfo, tokens: int) -> float:
-    return 2.0 * active_params(m) * tokens / (hw.peak_tflops * 1e12)
+    """Lower bound on the time to prefill ``tokens`` in one forward pass.
+
+    Three terms, two of which race:
+
+    * ``linear`` -- ``2 * active_params * tokens`` FLOPs: one multiply-add per active
+      parameter per token through the dense/expert projections.
+    * ``attn`` -- ``4 * tokens**2 * hidden * num_layers`` FLOPs: the quadratic
+      score-and-weighted-sum pair (two matmuls, 2 FLOPs each) that the linear term
+      ignores. Negligible at short context, dominant at long context.
+    * the weight stream -- ``weight_bytes / hbm_bw``: even a one-token prefill must read
+      every weight out of HBM once.
+
+    The compute terms share the same SMs, so they add; the result is the larger of that
+    sum and the weight stream, since the two overlap.
+    """
+    if tokens <= 0:
+        raise ValueError(f"tokens must be positive, got {tokens!r}")
+    linear = 2.0 * active_params(m) * tokens
+    attn = 4.0 * tokens**2 * m.hidden * m.num_layers
+    t_compute = (linear + attn) / (hw.peak_tflops * 1e12)
+    t_mem = weight_bytes(m) / (hw.hbm_bw_gbs * 1e9)
+    return max(t_compute, t_mem)
 
 
 def kv_capacity_tokens(
     hw: HardwareProfile, m: ModelInfo, gpu_mem_util: float, kv_dtype_bytes: int = 2
 ) -> float:
-    avail = hw.mem_gb * 1e9 * gpu_mem_util - weight_bytes(m) - ACTIVATION_RESERVE_GB * 1e9
+    """KV-cache tokens that fit once weights and the activation reserve are subtracted."""
+    if not 0 < gpu_mem_util <= 1:
+        raise ValueError(f"gpu_mem_util must be in (0, 1], got {gpu_mem_util!r}")
+    avail = mem_bytes(hw) * gpu_mem_util - weight_bytes(m) - reserve_bytes()
     return max(0.0, avail / kv_bytes_per_token(m, kv_dtype_bytes))
 ```
 
@@ -951,23 +1101,41 @@ from infervolt.core.types import ModelInfo
 
 MODELS: dict[str, ModelInfo] = {
     "mock/qwen3-0.6b": ModelInfo(
-        id="mock/qwen3-0.6b", arch="qwen3", params_b=0.6, num_layers=28, hidden=1024,
-        num_kv_heads=8, head_dim=128, max_pos=40960,
+        id="mock/qwen3-0.6b",
+        arch="qwen3",
+        params_b=0.6,
+        num_layers=28,
+        hidden=1024,
+        num_kv_heads=8,
+        head_dim=128,
+        max_pos=40960,
     ),
     "mock/qwen3-8b": ModelInfo(
-        id="mock/qwen3-8b", arch="qwen3", params_b=8.2, num_layers=36, hidden=4096,
-        num_kv_heads=8, head_dim=128, max_pos=40960,
+        id="mock/qwen3-8b",
+        arch="qwen3",
+        params_b=8.2,
+        num_layers=36,
+        hidden=4096,
+        num_kv_heads=8,
+        head_dim=128,
+        max_pos=40960,
     ),
     "mock/llama-70b": ModelInfo(
-        id="mock/llama-70b", arch="llama", params_b=70.0, num_layers=80, hidden=8192,
-        num_kv_heads=8, head_dim=128, max_pos=131072,
+        id="mock/llama-70b",
+        arch="llama",
+        params_b=70.0,
+        num_layers=80,
+        hidden=8192,
+        num_kv_heads=8,
+        head_dim=128,
+        max_pos=131072,
     ),
 }
 
 
 def get_model_info(model_id: str) -> ModelInfo:
     try:
-        return MODELS[model_id]
+        return MODELS[model_id].model_copy(deep=True)
     except KeyError as e:
         raise KeyError(f"unknown model {model_id!r}; known: {sorted(MODELS)}") from e
 ```
@@ -982,63 +1150,98 @@ from infervolt.core.types import SLO, LoadSpec, TokenDist, Workload
 
 PRESETS: dict[str, Workload] = {
     "chat-4k-512": Workload(
-        name="chat-4k-512", isl=TokenDist(p50=4096, p99=6000), osl=TokenDist(p50=512, p99=1024),
+        name="chat-4k-512",
+        isl=TokenDist(p50=4096, p99=6000),
+        osl=TokenDist(p50=512, p99=1024),
         prefix_share=0.1,
     ),
     "chat-1k-128": Workload(
-        name="chat-1k-128", isl=TokenDist(p50=1024, p99=2048), osl=TokenDist(p50=128, p99=256),
+        name="chat-1k-128",
+        isl=TokenDist(p50=1024, p99=2048),
+        osl=TokenDist(p50=128, p99=256),
         prefix_share=0.1,
     ),
     "chat-256-512": Workload(
-        name="chat-256-512", isl=TokenDist(p50=256, p99=512), osl=TokenDist(p50=512, p99=768),
+        name="chat-256-512",
+        isl=TokenDist(p50=256, p99=512),
+        osl=TokenDist(p50=512, p99=768),
         prefix_share=0.0,
     ),
     "rag-16k-64": Workload(
-        name="rag-16k-64", isl=TokenDist(p50=16384, p99=20000), osl=TokenDist(p50=64, p99=128),
-        prefix_share=0.0, load=LoadSpec(concurrency=[1, 4, 16, 64]),
+        name="rag-16k-64",
+        isl=TokenDist(p50=16384, p99=20000),
+        osl=TokenDist(p50=64, p99=128),
+        prefix_share=0.0,
+        load=LoadSpec(concurrency=[1, 4, 16, 64]),
     ),
     "agentic-prefix-16k-512": Workload(
-        name="agentic-prefix-16k-512", isl=TokenDist(p50=16384, p99=24000),
-        osl=TokenDist(p50=512, p99=1024), prefix_share=0.6,
+        name="agentic-prefix-16k-512",
+        isl=TokenDist(p50=16384, p99=24000),
+        osl=TokenDist(p50=512, p99=1024),
+        prefix_share=0.6,
     ),
 }
 
 
 def get_workload(name: str) -> Workload:
     try:
-        return PRESETS[name]
+        return PRESETS[name].model_copy(deep=True)
     except KeyError as e:
         raise KeyError(f"unknown workload {name!r}; known: {sorted(PRESETS)}") from e
 
 
 _UNITS = {"ms": 1.0, "s": 1000.0}
+# Longest suffix first, so "500ms" matches "ms" and never the "s" inside it.
+_SUFFIXES = sorted(_UNITS, key=len, reverse=True)
+
+_DURATION_KEYS = {"ttft": "ttft_ms", "itl": "itl_ms", "e2e": "e2e_ms"}
+_FRACTION_KEYS = {"p": "percentile", "g": "goodput_target"}
 
 
 def _ms(text: str) -> float:
-    for suffix, mult in _UNITS.items():
+    """Convert a duration literal ('500ms', '2 s', '250') to milliseconds."""
+    for suffix in _SUFFIXES:
         if text.endswith(suffix):
-            return float(text[: -len(suffix)]) * mult
+            return float(text[: -len(suffix)].strip()) * _UNITS[suffix]
     return float(text)
 
 
 def parse_slo(text: str) -> SLO:
-    """Parse 'ttft=500ms,itl=30ms,e2e=2s,p=0.9,g=0.9' into an SLO. Empty string -> no targets."""
-    slo = SLO()
+    """Parse 'ttft=500ms,itl=30ms,e2e=2s,p=0.9,g=0.9' into an SLO. Empty string -> no targets.
+
+    Whitespace around keys and values is ignored. Durations must be non-negative;
+    ``p`` and ``g`` are fractions in (0, 1], so a percentile written as ``p=95`` is
+    rejected rather than silently accepted as an impossible target.
+    """
+    fields: dict[str, float] = {}
     for part in filter(None, (p.strip() for p in text.split(","))):
-        key, _, value = part.partition("=")
-        if key == "ttft":
-            slo.ttft_ms = _ms(value)
-        elif key == "itl":
-            slo.itl_ms = _ms(value)
-        elif key == "e2e":
-            slo.e2e_ms = _ms(value)
-        elif key == "p":
-            slo.percentile = float(value)
-        elif key == "g":
-            slo.goodput_target = float(value)
+        raw_key, sep, raw_value = part.partition("=")
+        key, value = raw_key.strip(), raw_value.strip()
+        if key in _DURATION_KEYS:
+            if not sep:
+                raise ValueError(f"malformed SLO clause {part!r}")
+            try:
+                ms = _ms(value)
+            except ValueError as e:
+                raise ValueError(f"malformed SLO clause {part!r}") from e
+            if ms < 0:
+                raise ValueError(f"malformed SLO clause {part!r}: duration must be >= 0")
+            fields[_DURATION_KEYS[key]] = ms
+        elif key in _FRACTION_KEYS:
+            if not sep:
+                raise ValueError(f"malformed SLO clause {part!r}")
+            try:
+                frac = float(value)
+            except ValueError as e:
+                raise ValueError(f"malformed SLO clause {part!r}") from e
+            if not 0 < frac <= 1:
+                raise ValueError(
+                    f"malformed SLO clause {part!r}: {key!r} is a fraction in (0, 1], got {frac!r}"
+                )
+            fields[_FRACTION_KEYS[key]] = frac
         else:
             raise ValueError(f"unknown SLO key {key!r}; use ttft, itl, e2e, p, g")
-    return slo
+    return SLO(**fields)
 ```
 
 - [ ] **Step 4: Run tests and lint**
@@ -1111,15 +1314,19 @@ Expected: FAIL with `ModuleNotFoundError`.
 
 `src/infervolt/loadgen/base.py`:
 ```python
-"""Load generator protocol. M1 ships the mock simulator; M2 adds the multi-process HTTP generator."""
+"""Load generator protocol.
+
+M1 ships the mock simulator; M2 adds the multi-process HTTP generator.
+"""
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from infervolt.core.types import LoadResult, Workload
 
 
+@runtime_checkable
 class LoadGenerator(Protocol):
     def run(self, workload: Workload, concurrency: int, num_requests: int, seed: int) -> LoadResult:
         """Drive `num_requests` requests at fixed closed-loop `concurrency` and return records."""
@@ -1128,9 +1335,16 @@ class LoadGenerator(Protocol):
 
 `src/infervolt/loadgen/analysis.py`:
 ```python
-"""Turn per-request records into the Metrics the rules and the objective consume."""
+"""Turn per-request records into the Metrics the rules and the objective consume.
+
+Percentile units differ between the two layers this module bridges: ``_pct`` and numpy
+take a percentile in 0-100, while :attr:`SLO.percentile` is a fraction in 0-1. Every
+crossing multiplies by 100 -- keep that conversion at the call site, not in ``_pct``.
+"""
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
@@ -1138,40 +1352,65 @@ from infervolt.core.types import SLO, HardwareProfile, LoadResult, Metrics, Requ
 
 
 def _pct(values: list[float], p: float) -> float:
+    """Percentile of ``values``. ``p`` is in 0-100 (numpy's convention), not 0-1."""
     return float(np.percentile(values, p)) if values else 0.0
 
 
 def request_meets_slo(r: RequestRecord, slo: SLO) -> bool:
-    if not r.ok:
+    """True when the request did productive work *and* met every configured target.
+
+    Being productive -- succeeding and emitting at least one output token -- is a
+    precondition, not a target: goodput measures served work, so a request that failed
+    or returned nothing must never count, however fast it was.
+    """
+    if not r.ok or r.output_tokens <= 0:
         return False
     if slo.ttft_ms is not None and r.ttft_s * 1000 > slo.ttft_ms:
         return False
-    if slo.itl_ms is not None and r.itl_s:
-        if _pct(r.itl_s, slo.percentile * 100) * 1000 > slo.itl_ms:
-            return False
+    if (
+        slo.itl_ms is not None
+        and r.itl_s
+        and _pct(r.itl_s, slo.percentile * 100) * 1000 > slo.itl_ms
+    ):
+        return False
     return not (slo.e2e_ms is not None and r.e2e_s * 1000 > slo.e2e_ms)
 
 
 def compute_metrics(lr: LoadResult, slo: SLO, hw: HardwareProfile) -> Metrics:
+    """Summarise one load point.
+
+    Latency percentiles are taken over successful requests only; rates divide by
+    ``lr.duration_s`` (validated positive). ``usd_per_m_tokens`` prices the node --
+    ``hw.usd_per_hour`` is per GPU, so it is multiplied by ``hw.count`` -- against
+    *output* tokens alone, and is infinite when no output tokens were produced.
+    """
     ok = [r for r in lr.requests if r.ok]
     total = len(lr.requests)
     good = sum(1 for r in ok if request_meets_slo(r, slo))
-    dur = max(lr.duration_s, 1e-9)
+    dur = lr.duration_s
     ttft = [r.ttft_s * 1000 for r in ok]
     itl = [x * 1000 for r in ok for x in r.itl_s]
     e2e = [r.e2e_s * 1000 for r in ok]
     out_tokens = sum(r.output_tokens for r in ok)
     output_tps = out_tokens / dur
     usd_per_hour = hw.usd_per_hour * hw.count
-    usd_per_m = (usd_per_hour / 3600 / output_tps * 1e6) if output_tps > 0 else 0.0
+    usd_per_m = (usd_per_hour / 3600 / output_tps * 1e6) if output_tps > 0 else math.inf
     return Metrics(
-        ttft_p50_ms=_pct(ttft, 50), ttft_p90_ms=_pct(ttft, 90), ttft_p99_ms=_pct(ttft, 99),
-        itl_p50_ms=_pct(itl, 50), itl_p90_ms=_pct(itl, 90), itl_p99_ms=_pct(itl, 99),
-        e2e_p50_ms=_pct(e2e, 50), e2e_p90_ms=_pct(e2e, 90),
-        output_tps=output_tps, req_per_s=len(ok) / dur,
-        goodput_rps=good / dur, goodput_frac=(good / total) if total else 0.0,
+        ttft_p50_ms=_pct(ttft, 50),
+        ttft_p90_ms=_pct(ttft, 90),
+        ttft_p99_ms=_pct(ttft, 99),
+        itl_p50_ms=_pct(itl, 50),
+        itl_p90_ms=_pct(itl, 90),
+        itl_p99_ms=_pct(itl, 99),
+        e2e_p50_ms=_pct(e2e, 50),
+        e2e_p90_ms=_pct(e2e, 90),
+        output_tps=output_tps,
+        req_per_s=len(ok) / dur,
+        goodput_rps=good / dur,
+        goodput_frac=(good / total) if total else 0.0,
         error_rate=((total - len(ok)) / total) if total else 0.0,
-        tokens_per_s_per_gpu=output_tps / max(hw.count, 1), usd_per_m_tokens=usd_per_m,
+        tokens_per_s_per_gpu=output_tps / max(hw.count, 1),
+        usd_per_m_tokens=usd_per_m,
     )
 ```
 
