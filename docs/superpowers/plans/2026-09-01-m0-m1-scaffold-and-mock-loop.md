@@ -1022,7 +1022,7 @@ def _ms(text: str) -> float:
 
 
 def parse_slo(text: str) -> SLO:
-    """Parse 'ttft=500ms,itl=30ms,e2e=2s,p=0.9' into an SLO. Empty string -> no targets."""
+    """Parse 'ttft=500ms,itl=30ms,e2e=2s,p=0.9,g=0.9' into an SLO. Empty string -> no targets."""
     slo = SLO()
     for part in filter(None, (p.strip() for p in text.split(","))):
         key, _, value = part.partition("=")
@@ -1034,8 +1034,10 @@ def parse_slo(text: str) -> SLO:
             slo.e2e_ms = _ms(value)
         elif key == "p":
             slo.percentile = float(value)
+        elif key == "g":
+            slo.goodput_target = float(value)
         else:
-            raise ValueError(f"unknown SLO key {key!r}; use ttft, itl, e2e, p")
+            raise ValueError(f"unknown SLO key {key!r}; use ttft, itl, e2e, p, g")
     return slo
 ```
 
@@ -1510,6 +1512,7 @@ class RecipeSLO(BaseModel):
     itl_ms: float | None = None
     e2e_ms: float | None = None
     percentile: float = 0.9
+    goodput_target: float = 0.9
 
 
 class RecipeServe(BaseModel):
@@ -2851,7 +2854,7 @@ def summarize(obs: list[Observation], ctx: RunContext) -> Result:
     best = max(valid, key=lambda o: o.metrics.goodput_rps)
     return Result(
         observations=obs, objective=best.metrics.goodput_rps, feasible=True,
-        slo_met=best.metrics.goodput_frac >= ctx.slo.percentile, best_load_point=best.load_point,
+        slo_met=best.metrics.goodput_frac >= ctx.slo.goodput_target, best_load_point=best.load_point,
     )
 ```
 
@@ -3005,7 +3008,7 @@ def r0_under_loaded(x: RuleInput) -> Finding | None:
         (e.get("num_waiting", 0) < 0.5, 0.25),
         (e.get("num_running", 0) < 0.5 * e.get("max_num_seqs", 1), 0.25),
         (g.get("sm_active", 1) < 0.3, 0.25),
-        (m.goodput_frac >= x.ctx.slo.percentile, 0.25),
+        (m.goodput_frac >= x.ctx.slo.goodput_target, 0.25),
     ]
     return Finding(
         rule_id="R0", bottleneck="under_loaded", score=_score(conds),
@@ -3227,7 +3230,7 @@ from importlib.resources import files
 from typing import Any, Protocol, TypeVar
 
 from jinja2 import Environment, PackageLoader, select_autoescape
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from infervolt.core.types import KnobValue
 
@@ -3251,7 +3254,11 @@ class LLMClient(Protocol):
     def structured(self, *, system: str, user: str, schema: type[T]) -> T: ...
 
 
-class DiagnosisOut(BaseModel):
+class _Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DiagnosisOut(_Strict):
     primary_rule_id: str
     ranked_rule_ids: list[str]
     rationale: str
@@ -3259,24 +3266,24 @@ class DiagnosisOut(BaseModel):
     caveats: list[str] = Field(default_factory=list)
 
 
-class PriorOut(BaseModel):
+class PriorOut(_Strict):
     knobs: dict[str, KnobValue]
     hypothesis: str
 
 
-class SearchPlanOut(BaseModel):
+class SearchPlanOut(_Strict):
     subspaces: list[str]
     priors: list[PriorOut] = Field(default_factory=list)
     max_trials: int
     rationale: str = ""
 
 
-class InsightOut(BaseModel):
+class InsightOut(_Strict):
     text: str
     cites: list[str] = Field(default_factory=list)
 
 
-class NarrativeOut(BaseModel):
+class NarrativeOut(_Strict):
     rationale: str
     next_steps: list[str] = Field(default_factory=list)
     insights: list[InsightOut] = Field(default_factory=list)
@@ -3616,7 +3623,7 @@ class OpenAICompatClient:
         if client is None:
             import openai
 
-            client = openai.OpenAI(base_url=base_url, api_key=api_key)
+            client = openai.OpenAI(base_url=base_url, api_key=api_key)  # api_key is a plain str here
         self._client = client
 
     def structured(self, *, system: str, user: str, schema: type[T]) -> T:
@@ -3698,7 +3705,7 @@ def make_llm(name: str, settings: Settings) -> LLMClient:
     elif name == "anthropic":
         inner = AnthropicClient(model_id=settings.anthropic_model)
     elif name == "openai":
-        inner = OpenAICompatClient(model_id=settings.openai_model, base_url=settings.openai_base_url, api_key=settings.openai_api_key)
+        inner = OpenAICompatClient(model_id=settings.openai_model, base_url=settings.openai_base_url, api_key=settings.openai_api_key.get_secret_value())
     else:
         raise KeyError(f"unknown llm {name!r}; use fake, anthropic, or openai")
     if settings.llm_cassette is not None:
@@ -3913,9 +3920,11 @@ MIN_STAGE1_BEFORE_PRUNE = 3
 
 def _suggest(trial: optuna.Trial, k: Knob) -> KnobValue:
     if k.kind == "int":
-        return trial.suggest_int(k.name, int(k.low or 1), int(k.high or 1), log=k.log)
+        assert k.low is not None and k.high is not None  # guaranteed by Knob validator
+        return trial.suggest_int(k.name, int(k.low), int(k.high), log=k.log)
     if k.kind == "float":
-        return trial.suggest_float(k.name, float(k.low or 0), float(k.high or 1), step=k.step)
+        assert k.low is not None and k.high is not None  # guaranteed by Knob validator
+        return trial.suggest_float(k.name, float(k.low), float(k.high), step=k.step)
     if k.kind == "bool":
         return bool(trial.suggest_categorical(k.name, [True, False]))
     return trial.suggest_categorical(k.name, k.choices)  # type: ignore[return-value]
