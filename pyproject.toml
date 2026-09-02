@@ -61,7 +61,9 @@ select = ["E", "F", "I", "UP", "B", "SIM", "N"]
 ignore = ["N818"]
 
 [tool.mypy]
-python_version = "3.11"
+# 3.12 (the pinned dev/CI interpreter, see .python-version): numpy>=2.5 ships stubs
+# written in 3.12-only `type` syntax that mypy cannot parse under python_version 3.11.
+python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
 ignore_missing_imports = true
