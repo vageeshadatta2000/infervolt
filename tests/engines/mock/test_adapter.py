@@ -4,7 +4,7 @@ import pytest
 
 from infervolt.core.types import EngineConfig, KnobValue
 from infervolt.engines.base import LaunchError
-from infervolt.engines.mock.adapter import MockAdapter, _state
+from infervolt.engines.mock.adapter import MIN_RUN_FACTOR, MockAdapter, _state
 from infervolt.engines.mock.scenarios import SCENARIOS, make_context
 from infervolt.engines.registry import get_adapter
 from infervolt.loadgen.analysis import compute_metrics
@@ -146,3 +146,33 @@ def test_max_model_len_choices_start_at_the_workload_aware_default() -> None:
     assert knob.default == 8192
     assert knob.choices == [8192, 16384, 32768]
     assert all(int(c) >= ctx.workload.isl.p99 + ctx.workload.osl.p50 for c in knob.choices)
+
+
+def test_duration_varies_between_seeds_but_only_by_run_noise() -> None:
+    """Two runs of the same config differ, the way two runs on a real card differ.
+
+    A duration computed purely from the model is identical every time, so a verify with
+    a zero-variance delta would accept any config that is even a hair better -- the CI
+    would collapse onto the mean. A percent of run-to-run noise is what makes the
+    statistics do work.
+    """
+    adapter = MockAdapter()
+    ctx = make_context("kv", run_dir="/tmp/x")
+    cfg = EngineConfig(engine="mock", knobs=adapter.knob_space(ctx).defaults())
+    handle = adapter.launch(cfg, ctx)
+    a = adapter.loadgen(handle, ctx).run(ctx.workload, 64, 16, seed=1)
+    b = adapter.loadgen(handle, ctx).run(ctx.workload, 64, 16, seed=2)
+    assert a.duration_s != b.duration_s
+    assert a.duration_s == pytest.approx(b.duration_s, rel=0.05)
+
+
+def test_duration_stays_positive_under_every_run_noise_draw() -> None:
+    """Every rate in ``compute_metrics`` divides by ``duration_s``; the floor guarantees it."""
+    adapter = MockAdapter()
+    ctx = make_context("kv", run_dir="/tmp/x")
+    cfg = EngineConfig(engine="mock", knobs=adapter.knob_space(ctx).defaults())
+    handle = adapter.launch(cfg, ctx)
+    gen = adapter.loadgen(handle, ctx)
+    durations = [gen.run(ctx.workload, 64, 8, seed=s).duration_s for s in range(200)]
+    assert all(d > 0 for d in durations)
+    assert min(durations) >= MIN_RUN_FACTOR * 0.9 * statistics.fmean(durations)

@@ -19,6 +19,31 @@ from infervolt.engines.mock.model import DEFAULT_KNOBS, OomError, PerfModel, Sim
 from infervolt.loadgen.base import LoadGenerator
 
 NOISE = 0.03
+"""Per-request coefficient of variation on the sampled TTFT and ITLs."""
+
+RUN_NOISE = 0.005
+MIN_RUN_FACTOR = 0.9
+"""Run-to-run variation in the load phase's wall clock, and the floor on the factor.
+
+Per-request noise averages out: sixteen requests of five hundred tokens each leave the
+*total* service time within a fraction of a percent of the model, so a duration derived
+from it alone is effectively deterministic and every repeat of a verify measures the
+same goodput to twelve digits. A real card does not behave that way -- clocks drift,
+power caps bite, the allocator lands differently -- and reported goodput moves by one to
+three percent between otherwise identical runs. Without that, ``verify`` accepts any
+config a hair above the baseline: the paired CI collapses onto the mean and the
+statistics stop being a test of anything.
+
+Half a percent sits under that band rather than inside it, because three repeats is a
+very small sample: the 95% paired interval is 4.303 sd/sqrt(3) wide, so a full percent
+of run noise gives a half-width of about 0.025 rps against the +0.018 rps that the kv
+scenario's fp8 KV cache actually buys -- a real win the tests could not tell from zero.
+The simulator's job is to exercise the statistics, not to defeat them.
+
+The floor keeps the factor positive with an enormous margin (0.9 is twenty sigma below
+the mean), because every rate in ``compute_metrics`` divides by ``duration_s``.
+"""
+
 MAX_MODEL_LEN_CHOICES: tuple[int, ...] = (4096, 8192, 16384, 32768)
 INT_KNOBS = frozenset({"max_num_seqs", "max_num_batched_tokens"})
 
@@ -75,12 +100,20 @@ class SimLoadGenerator:
             return LoadResult(concurrency=concurrency, duration_s=1.0, requests=failed)
         base_itl = max(p.step_floor_s * 0.5, p.itl_mean_s - p.n_spikes * p.itl_spike_s / osl)
         reqs: list[RequestRecord] = []
+        service_s = 0.0
         for _ in range(num_requests):
-            ttft = p.ttft_s * (1 + NOISE * rng.standard_normal())
+            eps = rng.standard_normal()
+            ttft = p.ttft_s * (1 + NOISE * eps)
             itl = base_itl * (1 + NOISE * rng.standard_normal(osl))
             if p.n_spikes:
                 idx = rng.choice(osl, size=p.n_spikes, replace=False)
                 itl[idx] += p.itl_spike_s
+            # The server's own share of this request: its sampled end-to-end time less
+            # the queue wait, which the closed loop below accounts for separately (see
+            # SimPoint: ttft_s is measured from arrival and so already contains it).
+            # Summed from the draws rather than from the model, so the duration inherits
+            # the sampling noise instead of being computed around it.
+            service_s += (p.ttft_s - p.queue_wait_s) * (1 + NOISE * eps) + float(itl.sum())
             reqs.append(
                 RequestRecord(
                     ttft_s=float(max(ttft, 1e-4)),
@@ -88,13 +121,17 @@ class SimLoadGenerator:
                     output_tokens=osl,
                 )
             )
-        # Closed loop: ``running`` requests are in service at once and each takes
-        # ``lifetime_s``, so completions retire at running/lifetime_s. Queue wait is the
-        # time the *waiting* requests spend outside the server -- it lengthens each
-        # request's residence time, not the rate the server clears them -- so adding it
-        # here would double-count it. Little's law is the check: the resulting rate times
-        # (queue_wait_s + lifetime_s) comes back to exactly ``concurrency``.
-        duration = num_requests * p.lifetime_s / p.running
+        # Closed loop: ``running`` requests are in service at once, so the whole batch
+        # takes the total service time divided by ``running``. Queue wait is the time the
+        # *waiting* requests spend outside the server -- it lengthens each request's
+        # residence time, not the rate the server clears them -- which is why it was
+        # subtracted above rather than summed here. Preemption stretches every request's
+        # service by the same factor, so it multiplies the total rather than being
+        # sampled per request. Little's law is the check on all of it: the resulting rate
+        # times (queue_wait_s + lifetime_s) comes back to ``concurrency``, now within the
+        # run noise rather than exactly.
+        duration = service_s / p.running * (1 + p.preempt_frac)
+        duration *= max(1 + RUN_NOISE * rng.standard_normal(), MIN_RUN_FACTOR)
         return LoadResult(concurrency=concurrency, duration_s=float(duration), requests=reqs)
 
 
