@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import statistics
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -500,10 +501,12 @@ def _improvement_text(v: VerifyResult) -> str:
     """The headline win, as a percentage when the baseline had a rate to compare against.
 
     See :data:`BASELINE_FLOOR_RPS` for why the zero-baseline case is worded differently.
+    ``improvement_pct`` is infinite in exactly that case, so it is checked too: "+inf%"
+    is not a number to put in front of anyone.
     """
     ci = f"95% CI {v.ci_low:+.3f}..{v.ci_high:+.3f} rps at c={v.load_point}"
     base = statistics.fmean(v.baseline_goodput) if v.baseline_goodput else 0.0
-    if base < BASELINE_FLOOR_RPS:
+    if math.isinf(v.improvement_pct) or base < BASELINE_FLOOR_RPS:
         return (
             f"{v.delta_mean:+.3f} rps, from a baseline that served nothing "
             f"at c={v.load_point} ({ci})"
