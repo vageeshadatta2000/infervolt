@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import statistics
 
 import pytest
 
@@ -129,6 +130,8 @@ def test_verify_accepts_real_improvement_and_rejects_noise() -> None:
     assert v.accepted and v.ci_low > 0 and v.repeats == 3 and v.quality is not None
     assert v.quality.recovery >= 0.97
     assert v.improvement_pct > 0 and len(v.baseline_goodput) == 3
+    # The baseline served something at the candidate's load point, so the win is a ratio.
+    assert v.comparable and v.baseline_mean == pytest.approx(statistics.fmean(v.baseline_goodput))
     v2 = verify(adapter, ctx, base, marginal, MockQualityGuard(), repeats=3)
     assert not v2.accepted and v2.ci_low < 0 < v2.ci_high
     assert v2.reason == "improvement not distinguishable from noise"
@@ -312,6 +315,8 @@ def test_verify_result_round_trips_an_infinite_improvement() -> None:
         repeats=2,
     )
     assert math.isinf(v.improvement_pct)
+    # Nothing to be a percentage of: callers must word this one in absolute rps.
+    assert not v.comparable and v.baseline_mean == 0.0
     assert VerifyResult.model_validate_json(v.model_dump_json()) == v
 
 

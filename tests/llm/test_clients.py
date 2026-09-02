@@ -63,11 +63,45 @@ def test_anthropic_provider_error_becomes_llm_error() -> None:
     assert isinstance(excinfo.value.__cause__, anthropic.APIError)
 
 
-def test_anthropic_non_provider_error_is_not_swallowed() -> None:
-    with pytest.raises(RuntimeError):
-        AnthropicClient(client=_RaisingAnthropicStub(RuntimeError("bug"))).structured(
-            system="s", user="u", schema=DiagnosisOut
-        )
+def test_anthropic_non_provider_error_also_becomes_llm_error() -> None:
+    """Everything that escapes ``structured`` is the provider: the frame only calls the SDK.
+
+    The documented ``APIError``/``HTTPError`` tuple does not cover the failure a user is
+    most likely to hit -- no ``ANTHROPIC_API_KEY``, which the SDK reports as a plain
+    ``TypeError`` when the client is first built -- and the loop degrades on ``LLMError``.
+    A missing key must cost a run its narrative, not its measurements.
+    """
+    stub = _RaisingAnthropicStub(TypeError("Could not resolve authentication method"))
+    with pytest.raises(LLMError) as excinfo:
+        AnthropicClient(client=stub).structured(system="s", user="u", schema=DiagnosisOut)
+    assert "anthropic: TypeError" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, TypeError)
+
+
+def test_anthropic_missing_key_at_construction_becomes_llm_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Construction is lazy, so a key discovered missing there is still an ``LLMError``.
+
+    Building the SDK client in ``__init__`` would raise inside ``make_llm``, before the
+    planner exists to degrade around it -- killing a run over prose it could have
+    templated.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    client = AnthropicClient(model_id="claude-opus-5")  # no client passed: builds its own
+    with pytest.raises(LLMError):
+        client.structured(system="s", user="u", schema=DiagnosisOut)
+
+
+def test_openai_missing_client_construction_error_becomes_llm_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "openai.OpenAI", lambda **kw: (_ for _ in ()).throw(TypeError("no api_key"))
+    )
+    with pytest.raises(LLMError):
+        OpenAICompatClient(model_id="m").structured(system="s", user="u", schema=DiagnosisOut)
 
 
 def test_anthropic_missing_parsed_output_raises() -> None:
