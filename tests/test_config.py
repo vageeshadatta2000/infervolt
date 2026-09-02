@@ -7,11 +7,17 @@ from infervolt.config import Settings
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Drop any ambient INFERVOLT_* vars so tests see a pristine environment."""
+def _clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Give every test a pristine environment.
+
+    Settings reads ``.env`` relative to the working directory, so run from an empty
+    tmp_path as well as dropping ambient INFERVOLT_* vars -- otherwise a developer's
+    local .env silently changes what the defaults test sees.
+    """
     for key in list(os.environ):
         if key.startswith("INFERVOLT_"):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(tmp_path)
 
 
 def test_home_env_override_moves_derived_paths(

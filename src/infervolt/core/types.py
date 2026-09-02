@@ -37,17 +37,19 @@ class Workload(BaseModel):
 class SLO(BaseModel):
     """Latency targets plus how strictly they must hold.
 
-    ``percentile`` is the per-request latency percentile the ``*_ms`` targets are
-    measured at (e.g. 0.9 means the p90 of each latency must be under its target).
-    ``goodput_target`` is a different axis: the fraction of requests that must meet
-    the SLO for the run as a whole to count as "SLO met".
+    ``percentile`` applies to the per-request inter-token-latency distribution *only*:
+    a request passes ``itl_ms`` when the ``percentile`` quantile of its own ITLs is
+    under the target (0.9 means that request's p90 ITL). ``ttft_ms`` and ``e2e_ms``
+    have no distribution to summarise -- each request has one of each -- so they are
+    compared per request, directly. ``goodput_target`` is a different axis again: the
+    fraction of requests that must meet the SLO for the run to count as "SLO met".
     """
 
     ttft_ms: float | None = None
     itl_ms: float | None = None
     e2e_ms: float | None = None
-    percentile: float = 0.9
-    goodput_target: float = 0.9
+    percentile: float = Field(default=0.9, gt=0, le=1)
+    goodput_target: float = Field(default=0.9, gt=0, le=1)
 
 
 class HardwareProfile(BaseModel):

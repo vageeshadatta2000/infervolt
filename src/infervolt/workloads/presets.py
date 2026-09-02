@@ -47,30 +47,54 @@ def get_workload(name: str) -> Workload:
 
 
 _UNITS = {"ms": 1.0, "s": 1000.0}
+# Longest suffix first, so "500ms" matches "ms" and never the "s" inside it.
+_SUFFIXES = sorted(_UNITS, key=len, reverse=True)
+
+_DURATION_KEYS = {"ttft": "ttft_ms", "itl": "itl_ms", "e2e": "e2e_ms"}
+_FRACTION_KEYS = {"p": "percentile", "g": "goodput_target"}
 
 
 def _ms(text: str) -> float:
-    for suffix, mult in _UNITS.items():
+    """Convert a duration literal ('500ms', '2 s', '250') to milliseconds."""
+    for suffix in _SUFFIXES:
         if text.endswith(suffix):
-            return float(text[: -len(suffix)]) * mult
+            return float(text[: -len(suffix)].strip()) * _UNITS[suffix]
     return float(text)
 
 
 def parse_slo(text: str) -> SLO:
-    """Parse 'ttft=500ms,itl=30ms,e2e=2s,p=0.9,g=0.9' into an SLO. Empty string -> no targets."""
-    slo = SLO()
+    """Parse 'ttft=500ms,itl=30ms,e2e=2s,p=0.9,g=0.9' into an SLO. Empty string -> no targets.
+
+    Whitespace around keys and values is ignored. Durations must be non-negative;
+    ``p`` and ``g`` are fractions in (0, 1], so a percentile written as ``p=95`` is
+    rejected rather than silently accepted as an impossible target.
+    """
+    fields: dict[str, float] = {}
     for part in filter(None, (p.strip() for p in text.split(","))):
-        key, _, value = part.partition("=")
-        if key == "ttft":
-            slo.ttft_ms = _ms(value)
-        elif key == "itl":
-            slo.itl_ms = _ms(value)
-        elif key == "e2e":
-            slo.e2e_ms = _ms(value)
-        elif key == "p":
-            slo.percentile = float(value)
-        elif key == "g":
-            slo.goodput_target = float(value)
+        raw_key, sep, raw_value = part.partition("=")
+        key, value = raw_key.strip(), raw_value.strip()
+        if key in _DURATION_KEYS:
+            if not sep:
+                raise ValueError(f"malformed SLO clause {part!r}")
+            try:
+                ms = _ms(value)
+            except ValueError as e:
+                raise ValueError(f"malformed SLO clause {part!r}") from e
+            if ms < 0:
+                raise ValueError(f"malformed SLO clause {part!r}: duration must be >= 0")
+            fields[_DURATION_KEYS[key]] = ms
+        elif key in _FRACTION_KEYS:
+            if not sep:
+                raise ValueError(f"malformed SLO clause {part!r}")
+            try:
+                frac = float(value)
+            except ValueError as e:
+                raise ValueError(f"malformed SLO clause {part!r}") from e
+            if not 0 < frac <= 1:
+                raise ValueError(
+                    f"malformed SLO clause {part!r}: {key!r} is a fraction in (0, 1], got {frac!r}"
+                )
+            fields[_FRACTION_KEYS[key]] = frac
         else:
             raise ValueError(f"unknown SLO key {key!r}; use ttft, itl, e2e, p, g")
-    return slo
+    return SLO(**fields)

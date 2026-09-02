@@ -80,6 +80,21 @@ def test_slo_accepts_percentile_and_goodput_target() -> None:
     assert SLO().goodput_target == 0.9
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"percentile": 95.0},
+        {"percentile": 0.0},
+        {"percentile": -0.1},
+        {"goodput_target": 1.5},
+        {"goodput_target": 0.0},
+    ],
+)
+def test_slo_fractions_must_be_in_zero_to_one(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValidationError):
+        SLO(**kwargs)
+
+
 def test_bottleneck_priority_covers_every_bottleneck() -> None:
     assert set(typing.get_args(Bottleneck)) == set(BOTTLENECK_PRIORITY)
 

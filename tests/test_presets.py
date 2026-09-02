@@ -41,3 +41,40 @@ def test_parse_slo() -> None:
 def test_parse_slo_rejects_unknown_key() -> None:
     with pytest.raises(ValueError):
         parse_slo("latency=1ms")
+
+
+def test_parse_slo_tolerates_whitespace_around_keys_and_values() -> None:
+    slo = parse_slo(" ttft = 500ms , itl =  30 ms ,  p = 0.95 ")
+    assert slo.ttft_ms == 500
+    assert slo.itl_ms == 30
+    assert slo.percentile == 0.95
+
+
+def test_parse_slo_matches_the_longest_unit_suffix_first() -> None:
+    # 'ms' must win over 's', or 500ms would be read as 500 000 ms.
+    assert parse_slo("ttft=500ms").ttft_ms == 500
+    assert parse_slo("ttft=500s").ttft_ms == 500_000
+
+
+def test_parse_slo_rejects_a_clause_without_a_value() -> None:
+    with pytest.raises(ValueError, match="malformed SLO clause 'ttft'"):
+        parse_slo("ttft")
+    with pytest.raises(ValueError, match="malformed SLO clause"):
+        parse_slo("ttft=fast")
+
+
+@pytest.mark.parametrize("text", ["p=95", "p=0", "p=-0.5", "p=1.5", "g=95", "g=0", "g=1.01"])
+def test_parse_slo_rejects_out_of_range_fractions(text: str) -> None:
+    with pytest.raises(ValueError):
+        parse_slo(text)
+
+
+@pytest.mark.parametrize("text", ["ttft=-1ms", "itl=-30ms", "e2e=-2s"])
+def test_parse_slo_rejects_negative_durations(text: str) -> None:
+    with pytest.raises(ValueError):
+        parse_slo(text)
+
+
+def test_parse_slo_accepts_the_boundary_values() -> None:
+    assert parse_slo("p=1,g=1").percentile == 1.0
+    assert parse_slo("ttft=0ms").ttft_ms == 0.0
