@@ -2372,8 +2372,16 @@ class EngineVersion(BaseModel):
 
 @dataclass
 class ServerHandle:
+    """A running server, plus whatever the adapter needs to talk to it.
+
+    ``config`` is the config the server was actually launched with. The runner sets it
+    after a successful launch so that every observation taken through this handle can
+    record what produced it, without threading the config through each call.
+    """
+
     url: str
     state: Any = None
+    config: EngineConfig | None = None
 
 
 @dataclass
@@ -2601,6 +2609,9 @@ DEFAULT_KNOBS: dict[str, KnobValue] = {
     "max_num_seqs": 256,
     "max_num_batched_tokens": 2048,
     "gpu_memory_utilization": 0.9,
+    # Bare-model default only. MockAdapter.knob_space() overrides this with
+    # MockAdapter._default_max_model_len(ctx) -- the shortest offered length that covers
+    # the workload -- because a fixed 32768 OOMs at launch on small cards.
     "max_model_len": 32768,
     "enable_prefix_caching": True,
     "enable_chunked_prefill": True,
@@ -2911,6 +2922,23 @@ from infervolt.loadgen.base import LoadGenerator
 
 NOISE = 0.03
 MAX_MODEL_LEN_CHOICES: list[KnobValue] = [4096, 8192, 16384, 32768]
+INT_KNOBS = frozenset({"max_num_seqs", "max_num_batched_tokens"})
+
+
+def _as_number(value: KnobValue) -> float | None:
+    """Read a knob value as a number, or ``None`` if it is not one.
+
+    Bools are rejected outright: ``True`` is numerically 1, but a bool reaching an int
+    knob is a config mistake worth reporting rather than silently accepting.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 class MockState:
@@ -2934,7 +2962,9 @@ class SimLoadGenerator:
         pm = self.state.pm
         p = pm.point(concurrency)
         self.state.last = p
-        rng = np.random.default_rng(seed * 1000 + concurrency)
+        # Seed with the pair rather than a mixed scalar: default_rng hashes the sequence,
+        # so neighbouring (seed, concurrency) pairs cannot collide the way seed*1000+c can.
+        rng = np.random.default_rng([seed, concurrency])
         osl = workload.osl.p50
         if p.running == 0:
             # Nothing was admitted, so nothing completed. duration_s still has to be
@@ -2960,7 +2990,13 @@ class SimLoadGenerator:
                     output_tokens=osl,
                 )
             )
-        duration = num_requests * (p.lifetime_s + p.queue_wait_s) / p.running
+        # Closed loop: ``running`` requests are in service at once and each takes
+        # ``lifetime_s``, so completions retire at running/lifetime_s. Queue wait is the
+        # time the *waiting* requests spend outside the server -- it lengthens each
+        # request's residence time, not the rate the server clears them -- so adding it
+        # here would double-count it. Little's law is the check: the resulting rate times
+        # (queue_wait_s + lifetime_s) comes back to exactly ``concurrency``.
+        duration = num_requests * p.lifetime_s / p.running
         return LoadResult(concurrency=concurrency, duration_s=float(duration), requests=reqs)
 
 
@@ -2974,10 +3010,12 @@ class MockAdapter(EngineAdapter):
     def _default_max_model_len(ctx: RunContext) -> KnobValue:
         """Shortest offered context that still covers the workload.
 
-        The baseline config has to launch, and both ``validate`` (which rejects a
-        max_model_len below the workload) and ``PerfModel.check_launch`` (which rejects
-        one the KV cache cannot hold) get a say. Picking the smallest sufficient choice
-        satisfies the first and gives the second the most headroom.
+        This is workload-aware, not hardware-aware: it looks only at the workload's
+        p99 ISL plus p50 OSL, so ``validate`` (which rejects a max_model_len below the
+        workload) is satisfied and ``PerfModel.check_launch`` (which rejects one the KV
+        cache cannot hold) is given the most headroom the choices allow. It does *not*
+        guarantee a launch -- a small card with a long workload can still OOM here, and
+        that OOM is a real finding for the search to work around, not a bug.
         """
         need = ctx.workload.isl.p99 + ctx.workload.osl.p50
         for choice in MAX_MODEL_LEN_CHOICES:
@@ -3062,14 +3100,33 @@ class MockAdapter(EngineAdapter):
             ]
         )
 
+    @staticmethod
+    def _numeric_errors(knob: Knob, value: KnobValue) -> list[str]:
+        """Type and range complaints about one int/float knob. Never raises."""
+        num = _as_number(value)
+        if num is None:
+            return [f"{knob.name}={value!r} is not a number"]
+        if knob.name in INT_KNOBS and not float(num).is_integer():
+            return [f"{knob.name}={value!r} is not an int"]
+        if knob.low is not None and knob.high is not None and not knob.low <= num <= knob.high:
+            return [f"{knob.name}={value} outside [{knob.low}, {knob.high}]"]
+        return []
+
     def validate(self, cfg: EngineConfig, ctx: RunContext) -> list[str]:
+        """Every rejection reason for ``cfg``, as strings. This must never raise.
+
+        A caller hands us whatever the search or a user's YAML produced, and a
+        malformed knob is exactly what validation exists to report -- so a bad value
+        has to come back in the returned list, not out of the stack.
+        """
         errs: list[str] = []
         for knob in self.knob_space(ctx).knobs:
             if knob.name not in cfg.knobs:
                 continue
             value = cfg.knobs[knob.name]
-            if knob.kind == "cat" and value not in knob.choices:
-                errs.append(f"{knob.name}={value!r} is not one of {knob.choices!r}")
+            if knob.kind == "cat":
+                if value not in knob.choices:
+                    errs.append(f"{knob.name}={value!r} is not one of {knob.choices!r}")
             elif knob.kind == "bool":
                 try:
                     _as_bool(value)
@@ -3078,9 +3135,17 @@ class MockAdapter(EngineAdapter):
                         f"{knob.name}={value!r} is not a bool; "
                         f"choices: ['true', 'false', '1', '0', 'yes', 'no']"
                     )
+            else:
+                errs.extend(self._numeric_errors(knob, value))
         if cfg.knobs.get("quantization") == "fp8" and ctx.hw.compute_capability < 8.9:
             errs.append("fp8 quantization needs compute capability >= 8.9")
-        if int(cfg.knobs.get("max_model_len", 32768)) < ctx.workload.isl.p99 + ctx.workload.osl.p50:
+        # Only meaningful once max_model_len is known to be one of the offered lengths;
+        # the categorical check above has already reported anything else.
+        max_len = cfg.knobs.get("max_model_len", MAX_MODEL_LEN_CHOICES[-1])
+        if (
+            max_len in MAX_MODEL_LEN_CHOICES
+            and int(max_len) < ctx.workload.isl.p99 + ctx.workload.osl.p50
+        ):
             errs.append("max_model_len shorter than workload p99 ISL + OSL")
         return errs
 
@@ -3099,6 +3164,12 @@ class MockAdapter(EngineAdapter):
         return SimLoadGenerator(_state(handle))
 
     def scrape(self, handle: ServerHandle) -> dict[str, float]:
+        """Snapshot of the most recent load point, or ``{}`` before any load has run.
+
+        The simulator has no counters accumulating between calls: each ``run`` replaces
+        the stored ``SimPoint``, so scraping twice in a row returns the same numbers
+        rather than a fresh delta.
+        """
         st = _state(handle)
         p = st.last
         if p is None:
@@ -3299,51 +3370,77 @@ Expected: FAIL with `ModuleNotFoundError`.
 
 `src/infervolt/runner/trial.py`:
 ```python
-"""Execute one candidate: static validation, launch, sweep, scrape, stop, crash classification."""
+"""Execute one candidate: static validation, launch, sweep, scrape, stop, crash classification.
+
+Every exit from :func:`run_candidate` is a ``Trial`` with a terminal status. Nothing
+propagates: a candidate that OOMs, crashes, hangs or is statically rejected is a *result*
+the search has to learn from, not an error the caller has to handle.
+"""
 
 from __future__ import annotations
 
 import time
 
-from infervolt.core.types import Observation, Result, RunContext, Trial
+from infervolt.core.types import EngineConfig, Observation, Result, RunContext, Trial
 from infervolt.engines.base import EngineAdapter, LaunchError, ServerHandle
 from infervolt.loadgen.analysis import compute_metrics
 
+# Above any of these the load generator, not the server, is the thing being measured.
 CLIENT_CPU_MAX = 0.8
 CLIENT_LAG_MAX_MS = 5.0
 CLIENT_ERROR_MAX = 0.01
+# Sweep stop rules: quit once goodput has fallen this far below the best seen, or once
+# the server is shedding more than this share of requests.
 SWEEP_COLLAPSE = 0.8
 SWEEP_ERROR_MAX = 0.05
 
 
 def run_load_point(
-    adapter: EngineAdapter, handle: ServerHandle, ctx: RunContext, concurrency: int, num_requests: int
+    adapter: EngineAdapter,
+    handle: ServerHandle,
+    ctx: RunContext,
+    concurrency: int,
+    num_requests: int,
 ) -> tuple[Observation, float]:
+    """Drive one concurrency level and return the observation plus its wall-clock seconds."""
     lr = adapter.loadgen(handle, ctx).run(ctx.workload, concurrency, num_requests, ctx.seed)
-    metrics = compute_metrics(lr, ctx.slo, ctx.hw)
     obs = Observation(
-        load_point=concurrency, config=_cfg_of(handle, ctx), metrics=metrics,
-        engine=adapter.scrape(handle), gpu=adapter.gpu_stats(handle),
+        load_point=concurrency,
+        config=handle.config or EngineConfig(engine=adapter.name),
+        metrics=compute_metrics(lr, ctx.slo, ctx.hw),
+        engine=adapter.scrape(handle),
+        gpu=adapter.gpu_stats(handle),
     )
     h = lr.health
     if not any(r.ok for r in lr.requests):
+        # No latency percentile means anything here, and the sweep must not read the
+        # resulting zeros as a healthy point that simply scored badly.
         obs.valid, obs.invalid_reason = False, "no successful requests at this load point"
-    elif h.worker_cpu > CLIENT_CPU_MAX or h.loop_lag_p99_ms > CLIENT_LAG_MAX_MS or h.error_rate > CLIENT_ERROR_MAX:
+    elif (
+        h.worker_cpu > CLIENT_CPU_MAX
+        or h.loop_lag_p99_ms > CLIENT_LAG_MAX_MS
+        or h.error_rate > CLIENT_ERROR_MAX
+    ):
         obs.valid = False
         obs.invalid_reason = (
-            f"client artifact: cpu={h.worker_cpu:.2f} lag_p99={h.loop_lag_p99_ms:.1f}ms err={h.error_rate:.3f}"
+            f"client artifact: cpu={h.worker_cpu:.2f} "
+            f"lag_p99={h.loop_lag_p99_ms:.1f}ms err={h.error_rate:.3f}"
         )
     return obs, lr.duration_s
 
 
-def _cfg_of(handle: ServerHandle, ctx: RunContext):  # type: ignore[no-untyped-def]
-    return getattr(handle, "config", None) or ctx.model_extra_config  # replaced below
-
-
 def run_sweep(
-    adapter: EngineAdapter, handle: ServerHandle, ctx: RunContext, concurrencies: list[int], num_requests: int
+    adapter: EngineAdapter,
+    handle: ServerHandle,
+    ctx: RunContext,
+    concurrencies: list[int],
+    num_requests: int,
 ) -> tuple[list[Observation], float]:
-    """Increase concurrency until goodput collapses, errors rise, or the client is the bottleneck."""
+    """Increase concurrency until goodput collapses, errors rise, or the client is the bottleneck.
+
+    Returns every observation taken (including the one that triggered the stop) and the
+    total load seconds, which is what the trial is billed for.
+    """
     obs: list[Observation] = []
     total_s = 0.0
     best = 0.0
@@ -3360,9 +3457,14 @@ def run_sweep(
 
 
 def run_candidate(
-    adapter: EngineAdapter, trial: Trial, ctx: RunContext, concurrencies: list[int], num_requests: int,
+    adapter: EngineAdapter,
+    trial: Trial,
+    ctx: RunContext,
+    concurrencies: list[int],
+    num_requests: int,
     ready_timeout_s: float = 900.0,
 ) -> Trial:
+    """Take one candidate from config to a finished trial, in place."""
     cfg = trial.candidate.config
     trial.started = time.time()
     trial.status = "running"
@@ -3379,7 +3481,15 @@ def run_candidate(
         trial.status = "infeasible_oom" if kind == "oom" else "crash"
         trial.ended = time.time()
         return trial
-    handle.config = cfg  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001 - an adapter bug is still just a failed trial
+        # Adapters are contracted to raise LaunchError. One that does not is misbehaving,
+        # but taking the whole run down over it would lose every trial already completed.
+        trial.crash_kind = "startup"
+        trial.log_tail = f"{type(e).__name__}: {e}"
+        trial.status = "crash"
+        trial.ended = time.time()
+        return trial
+    handle.config = cfg
     try:
         if not adapter.ready(handle, ready_timeout_s):
             trial.status, trial.crash_kind = "timeout", "timeout"
@@ -3390,6 +3500,7 @@ def run_candidate(
         trial.ended = time.time()
     kind = adapter.classify_crash(exit_info)
     if kind != "none":
+        # The server died during the sweep; the numbers it produced cannot be trusted.
         trial.crash_kind, trial.log_tail = kind, exit_info.log_tail[-2000:]
         trial.status = "infeasible_oom" if kind == "oom" else "crash"
         return trial
@@ -3400,13 +3511,27 @@ def run_candidate(
 
 
 def summarize(obs: list[Observation], ctx: RunContext) -> Result:
+    """Pick the load point with the highest goodput and score the candidate by it.
+
+    Invalid observations are excluded from the choice but kept in ``observations``: the
+    diagnosis rules want to see the point where the sweep stopped and why.
+    """
     valid = [o for o in obs if o.valid]
     if not valid:
-        return Result(observations=obs, objective=0.0, feasible=True, slo_met=False, best_load_point=obs[0].load_point if obs else 0)
+        return Result(
+            observations=obs,
+            objective=0.0,
+            feasible=True,
+            slo_met=False,
+            best_load_point=obs[0].load_point if obs else 0,
+        )
     best = max(valid, key=lambda o: o.metrics.goodput_rps)
     return Result(
-        observations=obs, objective=best.metrics.goodput_rps, feasible=True,
-        slo_met=best.metrics.goodput_frac >= ctx.slo.goodput_target, best_load_point=best.load_point,
+        observations=obs,
+        objective=best.metrics.goodput_rps,
+        feasible=True,
+        slo_met=best.metrics.goodput_frac >= ctx.slo.goodput_target,
+        best_load_point=best.load_point,
     )
 ```
 
