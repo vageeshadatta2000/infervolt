@@ -2810,6 +2810,8 @@ git commit -m "feat(mock): roofline-based steady-state performance model"
 
 ### Task 11: Mock adapter, simulated load generator, scenarios
 
+> **Deviation record (2026-09-02):** `MockAdapter.knob_space()` sets the `max_model_len` default to the shortest choice covering `isl.p99 + osl.p50` instead of a fixed 32768, because on rtx4090-24 + qwen3-8b the KV cache holds ~31.5k tokens and a 32768 default OOMs at launch (the plan's own Task 10 OOM test relies on that). `max_model_len` only gates launch feasibility in the simulator, so nothing downstream loses a findable fix. `DEFAULT_KNOBS` in `model.py` keeps 32768 for the bare model.
+
 **Files:**
 - Create: `src/infervolt/engines/mock/adapter.py`, `src/infervolt/engines/mock/scenarios.py`, `tests/engines/mock/test_adapter.py`
 
