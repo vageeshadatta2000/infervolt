@@ -139,3 +139,60 @@ def test_novelty_uses_the_log_scale_for_log_knobs() -> None:
     seen = [{"max_num_seqs": 8}]
     assert is_novel({"max_num_seqs": 16}, seen, SPACE)
     assert not is_novel({"max_num_seqs": 9}, seen, SPACE)
+
+
+WEIGHTS_LOG = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 16.1 GiB"
+KV_LOG = (
+    "ValueError: The model's max seq len (32768) is larger than the maximum number of "
+    "tokens that can be stored in KV cache (9000)."
+)
+
+
+def test_weights_oom_raises_the_utilization_floor_and_spares_the_token_ceilings() -> None:
+    """Too little budget for weights means *more* util, not less -- and the tokens are innocent."""
+    b = Bounds(SPACE)
+    b.tighten_for(
+        WEIGHTS_LOG,
+        {"gpu_memory_utilization": 0.7, "max_model_len": 32768, "max_num_seqs": 512},
+    )
+    assert b.low["gpu_memory_utilization"] == 0.75
+    assert b.high == {
+        "gpu_memory_utilization": 0.95,
+        "max_model_len": 32768,
+        "max_num_seqs": 1024,
+    }
+    # The floor is honoured on the way out, so the sampler cannot revisit the dead region.
+    out = clamp({"gpu_memory_utilization": 0.7, "max_model_len": 4096, "max_num_seqs": 8}, SPACE, b)
+    assert out["gpu_memory_utilization"] == 0.75
+    assert out["max_model_len"] == 4096 and out["max_num_seqs"] == 8
+
+
+def test_weights_oom_floor_only_rises_and_never_passes_the_ceiling() -> None:
+    b = Bounds(SPACE)
+    b.tighten_for(WEIGHTS_LOG, {"gpu_memory_utilization": 0.85})
+    b.tighten_for(WEIGHTS_LOG, {"gpu_memory_utilization": 0.7})  # a lesser lesson
+    assert b.low["gpu_memory_utilization"] == 0.9
+    b.tighten_for(WEIGHTS_LOG, {"gpu_memory_utilization": 0.95})
+    assert b.low["gpu_memory_utilization"] == 0.95  # capped at the knob's own ceiling
+
+
+def test_kv_oom_tightens_the_token_ceilings_and_spares_the_utilization() -> None:
+    """The KV cache could not hold the context: shorten it, and leave the budget alone."""
+    b = Bounds(SPACE)
+    b.tighten_for(
+        KV_LOG, {"gpu_memory_utilization": 0.9, "max_model_len": 32768, "max_num_seqs": 512}
+    )
+    assert b.high["max_model_len"] == 16384 and b.high["max_num_seqs"] == 511
+    assert b.high["gpu_memory_utilization"] == 0.95
+    assert b.low["gpu_memory_utilization"] == 0.7
+
+
+def test_an_unrecognised_oom_falls_back_to_the_conservative_rule() -> None:
+    b = Bounds(SPACE)
+    b.tighten_for(
+        "Segmentation fault (core dumped)",
+        {"gpu_memory_utilization": 0.95, "max_model_len": 32768, "max_num_seqs": 512},
+    )
+    assert b.high["gpu_memory_utilization"] == 0.9
+    assert b.high["max_model_len"] == 16384
+    assert b.high["max_num_seqs"] == 511

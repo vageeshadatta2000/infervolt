@@ -123,6 +123,12 @@ class MockAdapter(EngineAdapter):
 
     def knob_space(self, ctx: RunContext) -> KnobSpace:
         d = DEFAULT_KNOBS
+        # Only the lengths that cover the workload are offered. A shorter one is not a
+        # bad idea the search should be allowed to test and reject -- ``validate``
+        # rejects it outright -- so keeping it in ``choices`` would only spend trials
+        # and inflate the space the novelty filter measures distances across.
+        min_len = self._default_max_model_len(ctx)
+        len_choices = [c for c in MAX_MODEL_LEN_CHOICES if c >= min_len] or [min_len]
         return KnobSpace(
             knobs=[
                 Knob(
@@ -156,8 +162,8 @@ class MockAdapter(EngineAdapter):
                     name="max_model_len",
                     kind="cat",
                     groups=["kv"],
-                    default=self._default_max_model_len(ctx),
-                    choices=list(MAX_MODEL_LEN_CHOICES),
+                    default=min_len,
+                    choices=list(len_choices),
                 ),
                 Knob(
                     name="enable_prefix_caching",

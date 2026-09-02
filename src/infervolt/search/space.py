@@ -36,10 +36,19 @@ def _numeric_choices(k: Knob) -> list[float] | None:
     return sorted(float(c) for c in k.choices)
 
 
-BACKOFF: dict[str, Callable[[float], float]] = {
-    "gpu_memory_utilization": lambda v: round(v - 0.05, 2),
+UTIL_KNOB = "gpu_memory_utilization"
+UTIL_STEP = 0.05
+"""One notch of ``gpu_memory_utilization``: the unit both the floor and the ceiling move in."""
+
+KV_BACKOFF: dict[str, Callable[[float], float]] = {
     "max_model_len": lambda v: v / 2,
     "max_num_seqs": lambda v: v - 1,
+}
+"""How far each *token* knob retreats from a config the KV cache could not hold."""
+
+BACKOFF: dict[str, Callable[[float], float]] = {
+    UTIL_KNOB: lambda v: round(v - UTIL_STEP, 2),
+    **KV_BACKOFF,
 }
 """How far each memory knob retreats from a value that just ran out of memory.
 
@@ -48,12 +57,21 @@ because the goal is to leave the region that failed, not to bisect it. Knobs abs
 this table are not memory knobs and are never tightened.
 """
 
+WEIGHTS_OOM_MARKERS = ("CUDA out of memory", "OutOfMemoryError")
+"""Log fragments that say the allocator ran dry putting *weights and reserve* on the card."""
+
+KV_OOM_MARKER = "larger than the maximum number of tokens"
+"""The log fragment that says the KV cache could not hold ``max_model_len`` tokens."""
+
 
 class Bounds:
-    """Upper bounds per knob, lowered whenever a config runs out of memory.
+    """The live floor and ceiling of every numeric knob, moved by what OOMs teach.
 
-    Only knobs with a numeric ceiling appear in ``high``; a categorical knob such as
-    ``kv_cache_dtype`` has no direction to back off in and is left out entirely.
+    Only knobs with a numeric range appear in ``high`` and ``low``; a categorical knob
+    such as ``kv_cache_dtype`` has no direction to back off in and is left out entirely.
+
+    Ceilings only fall and floors only rise, so the feasible box shrinks monotonically:
+    the search never re-enters a region a crash has already ruled out.
     """
 
     def __init__(self, space: KnobSpace) -> None:
@@ -85,13 +103,65 @@ class Bounds:
             if proposed >= self.low[name]:
                 self.high[name] = min(self.high[name], proposed)
 
+    def tighten_on_weights_oom(self, knobs: dict[str, KnobValue]) -> None:
+        """Raise the ``gpu_memory_utilization`` floor after an OOM caused by too *small* a budget.
+
+        An allocator that died fitting weights and its reserve was not given enough of
+        the card, so the fix points the opposite way from a KV overflow: the next config
+        needs a *higher* utilisation, not a shorter context. Tightening the token
+        ceilings here would be actively wrong -- it would shrink the very knobs that had
+        nothing to do with the failure, while leaving the sampler free to propose the
+        same starved utilisation again.
+
+        The new floor is capped at the knob's current ceiling so the range can never
+        invert, and only ever rises, so a later, smaller OOM teaches nothing.
+        """
+        value = knobs.get(UTIL_KNOB)
+        if UTIL_KNOB not in self.low or value is None or isinstance(value, (bool, str)):
+            return
+        proposed = min(round(float(value) + UTIL_STEP, 2), self.high[UTIL_KNOB])
+        self.low[UTIL_KNOB] = max(self.low[UTIL_KNOB], proposed)
+
+    def tighten_on_kv_oom(self, knobs: dict[str, KnobValue]) -> None:
+        """Lower the token ceilings after a config the KV cache could not hold.
+
+        The engine said in as many words that ``max_model_len`` exceeded the cache, so
+        the guilty knobs are known and ``gpu_memory_utilization`` is not among them --
+        it is already as high as it was asked to be, and lowering it would only make the
+        cache smaller still.
+        """
+        for name, value in knobs.items():
+            back_off = KV_BACKOFF.get(name)
+            if back_off is None or name not in self.high or isinstance(value, (bool, str)):
+                continue
+            proposed = back_off(float(value))
+            if proposed >= self.low[name]:
+                self.high[name] = min(self.high[name], proposed)
+
+    def tighten_for(self, log_tail: str, knobs: dict[str, KnobValue]) -> None:
+        """Apply whichever OOM rule ``log_tail`` identifies.
+
+        An OOM is only a useful lesson if the search learns the right direction from it,
+        and the engine's own message says which direction that is. Only when the log
+        names neither cause does the conservative rule apply -- blaming every memory
+        knob at once, which is safe but throws away range the failure never condemned.
+        """
+        if any(marker in log_tail for marker in WEIGHTS_OOM_MARKERS):
+            self.tighten_on_weights_oom(knobs)
+        elif KV_OOM_MARKER in log_tail:
+            self.tighten_on_kv_oom(knobs)
+        else:
+            self.tighten_on_oom(knobs)
+
 
 def clamp(knobs: dict[str, KnobValue], space: KnobSpace, bounds: Bounds) -> dict[str, KnobValue]:
-    """Pull every knob down to its current ceiling, preserving each knob's type.
+    """Pull every knob into ``[low, high]``, preserving each knob's type.
 
-    Categorical knobs snap to the largest *offered* choice at or below the ceiling, so a
-    clamped ``max_model_len`` is still a value the engine accepts. Knobs the bounds do
-    not track, and knobs absent from ``knobs``, pass through untouched.
+    Both directions matter: an OOM that blamed too little memory *raises* a floor, and a
+    proposal under that floor is as dead as one over a ceiling. Categorical knobs snap to
+    an *offered* choice inside the window, so a clamped ``max_model_len`` is still a
+    value the engine accepts. Knobs the bounds do not track, and knobs absent from
+    ``knobs``, pass through untouched.
     """
     out: dict[str, KnobValue] = dict(knobs)
     for k in space.knobs:
@@ -100,19 +170,19 @@ def clamp(knobs: dict[str, KnobValue], space: KnobSpace, bounds: Bounds) -> dict
         v = out[k.name]
         if isinstance(v, (bool, str)):
             continue
-        hi = bounds.high[k.name]
+        hi, lo = bounds.high[k.name], bounds.low[k.name]
         if k.kind == "int":
-            out[k.name] = min(int(v), int(hi))
+            out[k.name] = max(min(int(v), int(hi)), math.ceil(lo))
         elif k.kind == "float":
-            out[k.name] = min(float(v), hi)
+            out[k.name] = max(min(float(v), hi), lo)
         else:
             nc = _numeric_choices(k) or []
-            allowed = [c for c in nc if c <= hi]
+            allowed = [c for c in nc if lo <= c <= hi]
             if not allowed:
-                # Nothing the engine offers is under the ceiling, so there is no valid
+                # Nothing the engine offers is inside the window, so there is no valid
                 # value to snap to; leave the knob and let validation say so.
                 continue
-            capped = min(float(v), allowed[-1])
+            capped = max(min(float(v), allowed[-1]), allowed[0])
             out[k.name] = int(capped) if all(c.is_integer() for c in nc) else capped
     return out
 

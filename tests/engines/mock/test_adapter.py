@@ -131,3 +131,18 @@ def test_deterministic_with_seed() -> None:
 
 def test_registry_returns_mock() -> None:
     assert get_adapter("mock").name == "mock"
+
+
+def test_max_model_len_choices_start_at_the_workload_aware_default() -> None:
+    """The search must not be offered a context shorter than the workload it is serving.
+
+    ``validate`` would reject such a config anyway, so leaving 4096 in ``choices`` only
+    buys wasted trials -- and a novelty filter that thinks the space is bigger than the
+    part of it that can ever launch.
+    """
+    adapter = MockAdapter()
+    ctx = make_context("kv", run_dir="/tmp/x")  # chat-4k-512: needs 6000 + 512 tokens
+    knob = adapter.knob_space(ctx).get("max_model_len")
+    assert knob.default == 8192
+    assert knob.choices == [8192, 16384, 32768]
+    assert all(int(c) >= ctx.workload.isl.p99 + ctx.workload.osl.p50 for c in knob.choices)
