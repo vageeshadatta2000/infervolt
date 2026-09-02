@@ -18,6 +18,9 @@ DEFAULT_KNOBS: dict[str, KnobValue] = {
     "max_num_seqs": 256,
     "max_num_batched_tokens": 2048,
     "gpu_memory_utilization": 0.9,
+    # Bare-model default only. MockAdapter.knob_space() overrides this with
+    # MockAdapter._default_max_model_len(ctx) -- the shortest offered length that covers
+    # the workload -- because a fixed 32768 OOMs at launch on small cards.
     "max_model_len": 32768,
     "enable_prefix_caching": True,
     "enable_chunked_prefill": True,
