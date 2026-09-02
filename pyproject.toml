@@ -70,3 +70,6 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 markers = ["integration: end-to-end loop tests", "learning: memory learning tests"]
 addopts = "-ra"
+# TPESampler(multivariate=True) is a deliberate choice, not an accident to be reminded of
+# on every run; Optuna flags it experimental once per call site.
+filterwarnings = ["ignore::optuna.exceptions.ExperimentalWarning"]
