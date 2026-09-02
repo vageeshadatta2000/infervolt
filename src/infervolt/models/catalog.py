@@ -40,6 +40,6 @@ MODELS: dict[str, ModelInfo] = {
 
 def get_model_info(model_id: str) -> ModelInfo:
     try:
-        return MODELS[model_id]
+        return MODELS[model_id].model_copy(deep=True)
     except KeyError as e:
         raise KeyError(f"unknown model {model_id!r}; known: {sorted(MODELS)}") from e

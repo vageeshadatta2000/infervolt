@@ -54,7 +54,7 @@ class HardwareProfile(BaseModel):
     name: str
     gpu: str
     count: int = 1
-    mem_gb: float
+    mem_gb: float = Field(description="Device memory in GiB, as reported by NVML.")
     hbm_bw_gbs: float
     peak_tflops: float
     compute_capability: float

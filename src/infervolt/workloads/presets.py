@@ -41,7 +41,7 @@ PRESETS: dict[str, Workload] = {
 
 def get_workload(name: str) -> Workload:
     try:
-        return PRESETS[name]
+        return PRESETS[name].model_copy(deep=True)
     except KeyError as e:
         raise KeyError(f"unknown workload {name!r}; known: {sorted(PRESETS)}") from e
 

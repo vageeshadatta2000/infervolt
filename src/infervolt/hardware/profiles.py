@@ -57,4 +57,8 @@ PROFILES: dict[str, HardwareProfile] = {
 
 
 def get_profile(name: str) -> HardwareProfile:
-    return PROFILES[name]
+    """Return a private copy, so callers can adapt a profile without editing the registry."""
+    try:
+        return PROFILES[name].model_copy(deep=True)
+    except KeyError as e:
+        raise KeyError(f"unknown hardware profile {name!r}; known: {sorted(PROFILES)}") from e
