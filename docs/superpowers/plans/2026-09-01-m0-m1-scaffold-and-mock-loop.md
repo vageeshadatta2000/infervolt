@@ -2345,8 +2345,8 @@ class PerfModel:
 
     # ---- launch-time checks
     def check_launch(self) -> None:
-        need = roofline.weight_bytes(self.model) + roofline.ACTIVATION_RESERVE_GB * 1e9
-        if need > self.hw.mem_gb * 1e9 * self.util:
+        need = roofline.weight_bytes(self.model) + roofline.reserve_bytes()
+        if need > roofline.mem_bytes(self.hw) * self.util:
             raise OomError(
                 f"torch.OutOfMemoryError: CUDA out of memory. Tried to allocate {need / 1e9:.1f} GiB"
             )
@@ -2776,7 +2776,9 @@ def run_load_point(
         engine=adapter.scrape(handle), gpu=adapter.gpu_stats(handle),
     )
     h = lr.health
-    if h.worker_cpu > CLIENT_CPU_MAX or h.loop_lag_p99_ms > CLIENT_LAG_MAX_MS or h.error_rate > CLIENT_ERROR_MAX:
+    if not any(r.ok for r in lr.requests):
+        obs.valid, obs.invalid_reason = False, "no successful requests at this load point"
+    elif h.worker_cpu > CLIENT_CPU_MAX or h.loop_lag_p99_ms > CLIENT_LAG_MAX_MS or h.error_rate > CLIENT_ERROR_MAX:
         obs.valid = False
         obs.invalid_reason = (
             f"client artifact: cpu={h.worker_cpu:.2f} lag_p99={h.loop_lag_p99_ms:.1f}ms err={h.error_rate:.3f}"
