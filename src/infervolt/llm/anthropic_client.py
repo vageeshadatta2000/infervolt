@@ -38,15 +38,25 @@ def _provider_errors() -> tuple[type[BaseException], ...]:
 class AnthropicClient:
     def __init__(self, model_id: str = "claude-opus-5", client: Any | None = None) -> None:
         self.model_id = model_id
-        if client is None:
+        self._client: Any | None = client
+
+    def _sdk(self) -> Any:
+        """The SDK client, built on first use.
+
+        Constructing it is what discovers a missing ``ANTHROPIC_API_KEY``, so it happens
+        inside ``structured`` where that failure becomes an :class:`LLMError` the loop can
+        degrade around -- rather than at construction, where it would kill a run that had
+        every measurement it needed and only wanted prose.
+        """
+        if self._client is None:
             import anthropic
 
-            client = anthropic.Anthropic()
-        self._client: Any = client
+            self._client = anthropic.Anthropic()
+        return self._client
 
     def structured(self, *, system: str, user: str, schema: type[T]) -> T:
         try:
-            response = self._client.messages.parse(
+            response = self._sdk().messages.parse(
                 model=self.model_id,
                 max_tokens=16000,
                 system=system,
@@ -56,6 +66,14 @@ class AnthropicClient:
         except _provider_errors() as e:
             # Callers up the loop handle one failure type from every client. A bare
             # SDK/transport error leaking out would make each of them import the SDKs.
+            raise LLMError(f"anthropic: {type(e).__name__}: {e}") from e
+        except Exception as e:  # noqa: BLE001 - see below: every escape here is the SDK's
+            # The tuple above is the documented set, but it does not cover everything the
+            # SDK raises: a missing ``ANTHROPIC_API_KEY`` surfaces as a plain ``TypeError``
+            # from the constructor at the first call, and auth/config mistakes generally
+            # arrive as builtins. This frame only ever calls into the SDK, so anything
+            # that escapes it is the provider failing, and a caller that degrades on
+            # ``LLMError`` should degrade on a missing key too rather than die.
             raise LLMError(f"anthropic: {type(e).__name__}: {e}") from e
         if getattr(response, "stop_reason", None) == "refusal":
             raise LLMError("model refused the request")

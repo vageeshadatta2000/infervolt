@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from infervolt import __version__
 from infervolt.config import Settings
 from infervolt.core.types import Budget, KnobValue, OptimizeSpec
+from infervolt.hardware.profiles import PROFILES
 from infervolt.recipes.schema import Recipe
 from infervolt.workloads.presets import parse_slo
 
@@ -43,16 +44,25 @@ def _settings(home: Path | None) -> Settings:
     return Settings(home=home) if home else Settings()
 
 
+LLM_NAMES = ("fake", "anthropic", "openai")
+
+
 def _parse_kv(items: list[str]) -> dict[str, KnobValue]:
     """Parse ``k=v`` overrides, narrowing each value to the tightest type it parses as.
 
     Order matters: ``true``/``false`` before numbers (Python would read ``True`` as 1),
     ints before floats (``64`` is a sequence count, not 64.0), and anything left is a
     string -- which is what categorical knobs such as ``kv_cache_dtype=fp8`` want.
+
+    An item with no ``=`` is a usage error, not an empty-string override: ``--baseline
+    max_num_seqs 64`` (a space instead of an equals sign) would otherwise silently set
+    the knob to ``""`` and measure something nobody asked for.
     """
     out: dict[str, KnobValue] = {}
     for item in items:
-        k, _, v = item.partition("=")
+        k, sep, v = item.partition("=")
+        if not sep or not k:
+            raise typer.BadParameter(f"expected knob=value, got {item!r}", param_hint="--baseline")
         if v.lower() in ("true", "false"):
             out[k] = v.lower() == "true"
             continue
@@ -78,7 +88,11 @@ def optimize(
     llm: str = typer.Option("fake", help="fake | anthropic | openai"),
     max_trials: int = typer.Option(12, help="Trial budget for the search."),
     max_wall_s: float = typer.Option(3600.0, help="Wall-clock budget in seconds."),
-    max_usd: float = typer.Option(0.0, help="Cost budget in USD; 0 means unlimited."),
+    max_usd: float = typer.Option(
+        0.0,
+        help="Cost budget in USD; 0 means unlimited (cost accounting for real engines "
+        "arrives in M3; mock cost uses the profile's usd_per_hour).",
+    ),
     seed: int = typer.Option(7, help="Sampler and load-generator seed."),
     baseline: Annotated[
         list[str] | None,
@@ -91,6 +105,18 @@ def optimize(
     from infervolt.llm.factory import make_llm
     from infervolt.store.ledger import Ledger
 
+    if llm not in LLM_NAMES:
+        raise typer.BadParameter(
+            f"unknown llm {llm!r}; use {', '.join(LLM_NAMES)}", param_hint="--llm"
+        )
+    if hardware == "auto":
+        # The default is "auto" so that M2 can turn it on without changing anyone's
+        # command line; until then it is the one value the loop cannot serve, and saying
+        # so here is cheaper than a run that dies after opening a ledger row.
+        raise typer.BadParameter(
+            f"auto-detect arrives in M2; pass a profile name ({', '.join(sorted(PROFILES))})",
+            param_hint="--hardware",
+        )
     settings = _settings(home)
     spec = OptimizeSpec(
         engine=engine,
@@ -115,10 +141,22 @@ def report(
     home: Annotated[Path | None, typer.Option(help=HOME_HELP)] = None,
 ) -> None:
     """Print the report for a run."""
+    from infervolt.store.ledger import Ledger
+
     settings = _settings(home)
+    # The ledger is the authority on which runs exist, so an unknown id and a run that
+    # exists but produced no report get different answers -- "never heard of it" and "it
+    # got as far as <state>" are different problems with different next steps.
+    with Ledger(settings.ledger_path, settings.runs_dir) as ledger:
+        try:
+            row = ledger.get_run(run_id)
+        except KeyError:
+            typer.echo(f"unknown run {run_id}", err=True)
+            raise typer.Exit(code=1) from None
+        state = row.state
     path = settings.runs_dir / run_id / "report.md"
     if not path.exists():
-        typer.echo(f"no report for run {run_id}", err=True)
+        typer.echo(f"no report for run {run_id} (state: {state})", err=True)
         raise typer.Exit(code=1)
     typer.echo(path.read_text())
 

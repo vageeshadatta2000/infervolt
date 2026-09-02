@@ -76,6 +76,17 @@ class VerifyResult(BaseModel):
     load_point: int
     baseline_goodput: list[float]
     candidate_goodput: list[float]
+    baseline_mean: float = Field(
+        default=0.0, description="Mean goodput of the baseline arm over the repeats."
+    )
+    comparable: bool = Field(
+        default=False,
+        description="Whether the baseline had a rate to express the win as a fraction of. "
+        "Both arms are driven at the *candidate's* best load point, which the baseline may "
+        "not reach at all -- a config that OOMs or misses every deadline there scores a "
+        "clean zero -- and there is no percentage of zero. False says to report the gain in "
+        "absolute rps instead; it says nothing about whether the result was accepted.",
+    )
     delta_mean: float
     ci_low: float
     ci_high: float
@@ -239,6 +250,8 @@ def verify(
         load_point=c,
         baseline_goodput=b_vals,
         candidate_goodput=c_vals,
+        baseline_mean=base_mean,
+        comparable=base_mean > 0,
         delta_mean=mean,
         ci_low=lo,
         ci_high=hi,

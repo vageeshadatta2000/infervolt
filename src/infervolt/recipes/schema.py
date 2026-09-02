@@ -64,9 +64,18 @@ class RecipeServe(BaseModel):
     command: str = ""
 
 
+LOAD_POINT_DESC = (
+    "Concurrency the metrics were measured at. Baseline and tuned configs are each "
+    "reported at their own best load point, which is usually not the same number: a "
+    "config that holds more sequences serves its peak goodput further right. Without it "
+    "the summary table reads as two measurements of one operating point."
+)
+
+
 class RecipeMeasured(BaseModel):
     serve_args: dict[str, KnobValue] = Field(default_factory=dict)
     metrics: dict[str, float]
+    load_point: int | None = Field(default=None, description=LOAD_POINT_DESC)
 
 
 class RecipeQuality(BaseModel):
@@ -77,6 +86,7 @@ class RecipeQuality(BaseModel):
 
 class RecipeResult(BaseModel):
     metrics: dict[str, float]
+    load_point: int | None = Field(default=None, description=LOAD_POINT_DESC)
     repeats: int
     improvement: dict[str, str] = Field(default_factory=dict)
     quality: RecipeQuality | None = None
@@ -92,6 +102,13 @@ class RecipeDiagnosis(BaseModel):
     primary: Bottleneck
     confidence: float
     findings: list[RecipeFinding]
+    caveats: list[str] = Field(
+        default_factory=list,
+        description="What the diagnosis is not sure of -- a measurement artifact, a load "
+        "point that never saturated, a ranking that fell back to rule order because the "
+        "model was unavailable. The reader of a recipe is entitled to the same doubts the "
+        "run had.",
+    )
 
 
 class RecipeSearch(BaseModel):

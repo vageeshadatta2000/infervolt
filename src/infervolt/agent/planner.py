@@ -14,7 +14,6 @@ from __future__ import annotations
 import contextlib
 import json
 import math
-import statistics
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +26,7 @@ from infervolt.core.types import (
     Candidate,
     Diagnosis,
     EngineConfig,
+    Evidence,
     KnobSpace,
     KnobValue,
     OptimizeSpec,
@@ -35,6 +35,7 @@ from infervolt.core.types import (
     RunState,
     SearchPlan,
     Trial,
+    TrialStatus,
 )
 from infervolt.diagnose.ranker import rank
 from infervolt.diagnose.rules import evaluate_rules
@@ -44,7 +45,6 @@ from infervolt.hardware.profiles import get_profile
 from infervolt.llm.base import (
     SYSTEM_PROMPT,
     LLMClient,
-    LLMError,
     NarrativeOut,
     SearchPlanOut,
     prompts_sha,
@@ -98,14 +98,12 @@ TARGET_FRACTION = 0.95
 """Share of the final best objective that counts as "reached the target", for
 ``trials_to_target``."""
 
-BASELINE_FLOOR_RPS = 1e-6
-"""Below this the baseline served nothing at the verified load point.
+INFEASIBLE_STATUSES: tuple[TrialStatus, ...] = ("infeasible_oom", "crash", "rejected", "timeout")
+"""Trial outcomes the recipe counts as "the config could not be measured".
 
-Verification drives both arms at the *candidate's* best load point, which the baseline
-may not reach at all -- a config that OOMs or misses every SLO deadline there scores a
-clean zero. The ratio to zero is not a percentage anyone should read, so the recipe
-states the absolute gain instead. Only the wording changes; the accept/reject decision
-and ``improvement_pct`` are verify's and are reported unaltered."""
+A ``timeout`` belongs here with the OOMs and the crashes: a server that never came up, or
+a load point that never finished, produced no objective, and counting it as a candidate
+that merely lost would understate how much of the space this hardware refuses."""
 
 
 class Planner:
@@ -149,6 +147,9 @@ class Planner:
         tracker = BudgetTracker(self.spec.budget)
         self.log(f"run: {run_id}")
 
+        if errs := _baseline_errors(self.spec.baseline, space):
+            return self._fail(run_id, f"invalid --baseline: {'; '.join(errs)}")
+
         self._state(run_id, "baseline")
         baseline = self._baseline(ctx, space)
         if baseline.status != "ok" or baseline.result is None:
@@ -165,7 +166,12 @@ class Planner:
             baseline.result.observations, ctx, baseline.candidate.config, space
         )
         diagnosis = rank(
-            self.llm, findings, ctx, baseline.result.observations, baseline.candidate.config.knobs
+            self.llm,
+            findings,
+            ctx,
+            baseline.result.observations,
+            baseline.candidate.config.knobs,
+            log=self.log,
         )
         self.ledger.set_diagnosis(run_id, diagnosis.model_dump_json())
         self.log(
@@ -206,6 +212,14 @@ class Planner:
         if best.result is None or best.result.objective <= baseline.result.objective:
             return self._finish_without_change(
                 run_id, ctx, baseline, diagnosis, "search found nothing better than baseline"
+            )
+        # Verification is several more launches -- the most expensive stage in the loop --
+        # so the budget is re-checked here rather than only inside the search. The trial
+        # counter is deliberately not consulted: a search that spent every trial did its
+        # job, and refusing to verify its winner would throw the run away at the end.
+        if why := tracker.exhausted(count_trials=False):
+            return self._finish_without_change(
+                run_id, ctx, baseline, diagnosis, f"stopped before verification: {why}"
             )
 
         self._state(run_id, "verify")
@@ -300,8 +314,11 @@ class Planner:
             out = self.llm.structured(
                 system=SYSTEM_PROMPT, user=render_prompt("plan", context), schema=SearchPlanOut
             )
-        except LLMError as e:
-            self.log(f"plan: LLM failed ({e}); searching the diagnosis sub-spaces without priors")
+        except Exception as e:  # noqa: BLE001 - any client failure degrades to no priors
+            self.log(
+                f"plan: llm error: {type(e).__name__}: {e}; "
+                "searching the diagnosis sub-spaces without priors"
+            )
             out = SearchPlanOut(
                 subspaces=diagnosis.subspaces, max_trials=self.spec.budget.max_trials
             )
@@ -315,7 +332,13 @@ class Planner:
             if unknown:
                 self.log(f"plan: dropping unknown knobs {sorted(unknown)} from prior {i}")
             knobs = clamp({k: v for k, v in p.knobs.items() if k in names}, space, bounds)
-            knobs = {k: v for k, v in knobs.items() if _in_choices(space, k, v)}
+            off_menu = {k: v for k, v in knobs.items() if not _in_choices(space, k, v)}
+            if off_menu:
+                # Clamping cannot rescue a categorical: there is no nearest legal value to
+                # move to, only a list the value is not on. Say so rather than dropping it
+                # silently, so a plan that half survived does not read like one that fit.
+                self.log(f"plan: dropping out-of-choices knobs {off_menu} from prior {i}")
+            knobs = {k: v for k, v in knobs.items() if k not in off_menu}
             if not knobs:
                 continue
             cfg = base_cfg.with_knobs(**knobs)
@@ -399,10 +422,13 @@ class Planner:
             slo=RecipeSLO(**ctx.slo.model_dump()),
             serve=RecipeServe(args=args, command=command),
             baseline=RecipeMeasured(
-                serve_args=dict(baseline.candidate.config.knobs), metrics=b_metrics
+                serve_args=dict(baseline.candidate.config.knobs),
+                metrics=b_metrics,
+                load_point=base_c,
             ),
             result=RecipeResult(
                 metrics=c_metrics,
+                load_point=best.result.best_load_point,
                 repeats=v.repeats,
                 improvement={"goodput_rps": _improvement_text(v)},
                 quality=RecipeQuality(**v.quality.model_dump()) if v.quality else None,
@@ -413,16 +439,17 @@ class Planner:
                     primary=diagnosis.primary,
                     confidence=diagnosis.confidence,
                     findings=[
-                        RecipeFinding(rule=f.rule_id, score=f.score, evidence=f.evidence)
+                        RecipeFinding(
+                            rule=f.rule_id, score=f.score, evidence=[_round(e) for e in f.evidence]
+                        )
                         for f in diagnosis.ranked
                     ],
+                    caveats=diagnosis.caveats,
                 ),
                 rationale=narrative.rationale,
                 search=RecipeSearch(
                     trials=len(trials),
-                    infeasible=sum(
-                        t.status in ("infeasible_oom", "crash", "rejected") for t in trials
-                    ),
+                    infeasible=sum(t.status in INFEASIBLE_STATUSES for t in trials),
                     subspace=[k.name for k in space.subspace(plan.subspaces).knobs],
                     optimizer="optuna-tpe",
                     seed=self.spec.seed,
@@ -458,9 +485,10 @@ class Planner:
             return self.llm.structured(
                 system=SYSTEM_PROMPT, user=render_prompt("emit", context), schema=NarrativeOut
             )
-        except LLMError:
+        except Exception as e:  # noqa: BLE001 - any client failure degrades to a template
             # The measurements are the recipe; the prose is not. Losing the model here
-            # costs a sentence, not the run.
+            # costs a sentence, not the run -- whatever the client failed with.
+            self.log(f"emit: llm error: {type(e).__name__}: {e}; using the template narrative")
             return NarrativeOut(
                 rationale=f"{diagnosis.rationale} Winning knobs: {json.dumps(winning)}.",
                 next_steps=["Re-run diagnosis on the tuned config."],
@@ -497,16 +525,46 @@ class Planner:
         self.ledger.set_state(run_id, state)
 
 
+def _round(e: Evidence) -> Evidence:
+    """One evidence value at four significant digits.
+
+    Rules compute in floating point, so a ratio lands as ``1.9999999999999998`` as often
+    as ``2.0``; four significant digits is more precision than any of these numbers earn
+    and stops the recipe from implying otherwise. Significant digits rather than decimal
+    places because the values span ``0.0001234`` (a fraction) to ``123400`` (a token rate).
+    """
+    return e.model_copy(update={"value": float(f"{e.value:.4g}")})
+
+
+def _baseline_errors(baseline: dict[str, KnobValue], space: KnobSpace) -> list[str]:
+    """Everything wrong with ``--baseline`` overrides, checked before anything is launched.
+
+    A typo'd knob name is silently harmless today -- it lands in the config dict, the
+    adapter ignores it, and the run measures the default instead while reporting the
+    override. That is worse than failing: the recipe then answers a question nobody asked.
+    """
+    errors: list[str] = []
+    names = space.names()
+    for name, value in baseline.items():
+        if name not in names:
+            errors.append(f"unknown knob {name!r}; known knobs: {', '.join(sorted(names))}")
+            continue
+        knob = space.get(name)
+        if knob.kind == "cat" and value not in knob.choices:
+            errors.append(f"{name}={value!r} is not one of {knob.choices!r}")
+    return errors
+
+
 def _improvement_text(v: VerifyResult) -> str:
     """The headline win, as a percentage when the baseline had a rate to compare against.
 
-    See :data:`BASELINE_FLOOR_RPS` for why the zero-baseline case is worded differently.
-    ``improvement_pct`` is infinite in exactly that case, so it is checked too: "+inf%"
-    is not a number to put in front of anyone.
+    ``VerifyResult.comparable`` is verify's own answer to "was there a baseline rate to be
+    a percentage of", so it is taken rather than re-derived here; see its field docs for
+    why an arm can score zero. ``improvement_pct`` is infinite in exactly that case and is
+    checked too: "+inf%" is not a number to put in front of anyone.
     """
     ci = f"95% CI {v.ci_low:+.3f}..{v.ci_high:+.3f} rps at c={v.load_point}"
-    base = statistics.fmean(v.baseline_goodput) if v.baseline_goodput else 0.0
-    if math.isinf(v.improvement_pct) or base < BASELINE_FLOOR_RPS:
+    if math.isinf(v.improvement_pct) or not v.comparable:
         return (
             f"{v.delta_mean:+.3f} rps, from a baseline that served nothing "
             f"at c={v.load_point} ({ci})"

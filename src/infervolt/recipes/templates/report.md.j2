@@ -4,7 +4,7 @@ Run `{{ r.infervolt.run_id }}` Â· created {{ r.infervolt.provenance.created }} Â
 
 ## Summary
 
-| Metric | Baseline | Tuned |
+| Metric | Baseline{% if r.baseline.load_point is not none %} (c={{ r.baseline.load_point }}){% endif %} | Tuned{% if r.result.load_point is not none %} (c={{ r.result.load_point }}){% endif %} |
 |---|---|---|
 {% for k, v in r.result.metrics.items() %}
 | {{ k }} | {{ '%.3f' % r.baseline.metrics.get(k, 0.0) }} | {{ '%.3f' % v }} |
@@ -25,6 +25,14 @@ Verified with {{ r.result.repeats }} interleaved repeats.
 {% for f in r.infervolt.diagnosis.findings %}
 | {{ f.rule }} | {{ '%.2f' % f.score }} | {% for e in f.evidence %}`{{ e.key }}`={{ '%.4g' % e.value }}{{ e.unit }}{% if not loop.last %}, {% endif %}{% endfor %} |
 {% endfor %}
+
+{% if r.infervolt.diagnosis.caveats %}
+Caveats from diagnosis:
+
+{% for c in r.infervolt.diagnosis.caveats %}
+- {{ c }}
+{% endfor %}
+{% endif %}
 
 ## Winning configuration
 

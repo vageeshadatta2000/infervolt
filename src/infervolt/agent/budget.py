@@ -30,13 +30,20 @@ class BudgetTracker:
         self.spent_usd += usd
         self.trials += 1
 
-    def exhausted(self) -> str | None:
-        """Why the budget is spent, or ``None`` while it is not."""
+    def exhausted(self, *, count_trials: bool = True) -> str | None:
+        """Why the budget is spent, or ``None`` while it is not.
+
+        ``count_trials=False`` asks only about the resources a run can still *waste*.
+        Spending every trial is what the search is for, so a caller deciding whether the
+        verification it already earned may go ahead asks without the trial counter --
+        wall-clock and money are gone whether or not the work was worth it, but a search
+        that used its whole trial budget is a search that finished.
+        """
         if time.time() > self.deadline:
             return "wall-clock budget exhausted"
         # ``max_usd`` of 0 means unlimited, which is also what an untracked engine reports.
         if self.budget.max_usd and self.spent_usd > self.budget.max_usd:
             return f"cost budget exhausted (${self.spent_usd:.2f})"
-        if self.trials >= self.budget.max_trials:
+        if count_trials and self.trials >= self.budget.max_trials:
             return "trial budget exhausted"
         return None

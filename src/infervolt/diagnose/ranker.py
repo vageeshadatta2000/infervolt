@@ -9,10 +9,11 @@ narrative -- never its diagnosis.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from infervolt.core.types import Diagnosis, Finding, KnobValue, Observation, RunContext
-from infervolt.llm.base import SYSTEM_PROMPT, DiagnosisOut, LLMClient, LLMError, render_prompt
+from infervolt.llm.base import SYSTEM_PROMPT, DiagnosisOut, LLMClient, render_prompt
 
 ATTEMPTS = 2
 """Tries given to the model before falling back. A schema-valid but hallucinating reply
@@ -27,6 +28,7 @@ def rank(
     ctx: RunContext,
     obs: list[Observation],
     knobs: dict[str, KnobValue],
+    log: Callable[[str], None] = lambda _: None,
 ) -> Diagnosis:
     """Turn scored findings into a diagnosis, asking ``llm`` to rank and explain them."""
     if not findings:
@@ -62,7 +64,11 @@ def rank(
             cand = llm.structured(
                 system=SYSTEM_PROMPT, user=render_prompt("rank", context), schema=DiagnosisOut
             )
-        except LLMError:
+        except Exception as e:  # noqa: BLE001 - any client failure falls back to rule order
+            # Not just LLMError: a missing API key, a typo'd base URL or an SDK that
+            # changed its exception hierarchy are all "no ranking today", and the
+            # deterministic order underneath is a complete answer on its own.
+            log(f"rank: llm error: {type(e).__name__}: {e}")
             continue
         # The model may only rank rules it was shown. Anything else is a hallucination,
         # however confident, and the whole reply goes with it.

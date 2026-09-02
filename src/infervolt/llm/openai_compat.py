@@ -57,11 +57,23 @@ class OpenAICompatClient:
         client: Any | None = None,
     ) -> None:
         self.model_id = model_id
-        if client is None:
+        self._base_url = base_url
+        self._api_key = api_key
+        self._client: Any | None = client
+
+    def _sdk(self) -> Any:
+        """The SDK client, built on first use.
+
+        As in ``anthropic_client``: a bad key or unreachable base URL should surface as an
+        :class:`LLMError` from ``structured``, which the loop degrades around, not as a
+        constructor blowing up before the run starts.
+        """
+        if self._client is None:
             import openai
 
-            client = openai.OpenAI(base_url=base_url, api_key=api_key)  # api_key is a plain str
-        self._client: Any = client
+            # api_key is a plain str by the time it reaches here.
+            self._client = openai.OpenAI(base_url=self._base_url, api_key=self._api_key)
+        return self._client
 
     def structured(self, *, system: str, user: str, schema: type[T]) -> T:
         messages: list[dict[str, str]] = [
@@ -75,12 +87,18 @@ class OpenAICompatClient:
         last_error = ""
         for _ in range(2):
             try:
-                resp = self._client.chat.completions.create(
+                resp = self._sdk().chat.completions.create(
                     model=self.model_id, messages=messages, response_format=fmt
                 )
             except _provider_errors() as e:
                 # A transport or API failure is not something a repair round trip can
                 # fix, so it ends the loop instead of burning the retry.
+                raise LLMError(f"openai: {type(e).__name__}: {e}") from e
+            except Exception as e:  # noqa: BLE001 - this frame only ever calls the SDK
+                # The tuple above is the documented set; construction and auth mistakes
+                # arrive as builtins (a missing key is a ``TypeError``/``OpenAIError``).
+                # Everything reachable from here is the provider, so everything that
+                # escapes it is a provider failure the caller should degrade around.
                 raise LLMError(f"openai: {type(e).__name__}: {e}") from e
             text = resp.choices[0].message.content or ""
             for candidate in _json_candidates(text):
