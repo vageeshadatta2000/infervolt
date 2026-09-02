@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
 
 from pydantic import BaseModel
 
@@ -50,26 +52,30 @@ class Ledger:
         self.runs_dir = runs_dir
         db_path.parent.mkdir(parents=True, exist_ok=True)
         runs_dir.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
 
     # ---- runs
     def create_run(self, spec: OptimizeSpec) -> str:
         run_id = spec.run_id or new_run_id()
         self.run_dir(run_id).mkdir(parents=True, exist_ok=True)
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
-                "INSERT OR REPLACE INTO runs(id, created, spec, state) VALUES (?,?,?,?)",
+                "INSERT OR IGNORE INTO runs(id, created, spec, state) VALUES (?,?,?,?)",
                 (run_id, time.time(), spec.model_dump_json(), "prepare"),
             )
         return run_id
 
     def get_run(self, run_id: str) -> RunRow:
-        row = self._conn.execute(
-            "SELECT id, created, spec, state, best_trial_id, recipe_path, diagnosis "
-            "FROM runs WHERE id=?",
-            (run_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, created, spec, state, best_trial_id, recipe_path, diagnosis "
+                "FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
         if row is None:
             raise KeyError(run_id)
         return RunRow(
@@ -82,25 +88,35 @@ class Ledger:
             diagnosis_json=row[6],
         )
 
+    def _update_run(self, run_id: str, sql: str, value: object) -> None:
+        """Apply a single-column update, raising ``KeyError`` when the run does not exist."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(sql, (value, run_id))
+        if cursor.rowcount == 0:
+            raise KeyError(run_id)
+
     def set_state(self, run_id: str, state: RunState) -> None:
-        with self._conn:
-            self._conn.execute("UPDATE runs SET state=? WHERE id=?", (state, run_id))
+        self._update_run(run_id, "UPDATE runs SET state=? WHERE id=?", state)
 
     def set_best(self, run_id: str, trial_id: str | None) -> None:
-        with self._conn:
-            self._conn.execute("UPDATE runs SET best_trial_id=? WHERE id=?", (trial_id, run_id))
+        self._update_run(run_id, "UPDATE runs SET best_trial_id=? WHERE id=?", trial_id)
 
     def set_recipe(self, run_id: str, path: str) -> None:
-        with self._conn:
-            self._conn.execute("UPDATE runs SET recipe_path=? WHERE id=?", (path, run_id))
+        self._update_run(run_id, "UPDATE runs SET recipe_path=? WHERE id=?", path)
 
     def set_diagnosis(self, run_id: str, diagnosis_json: str) -> None:
-        with self._conn:
-            self._conn.execute("UPDATE runs SET diagnosis=? WHERE id=?", (diagnosis_json, run_id))
+        self._update_run(run_id, "UPDATE runs SET diagnosis=? WHERE id=?", diagnosis_json)
 
     # ---- trials
     def save_trial(self, trial: Trial) -> None:
-        with self._conn:
+        """Upsert the trial row and append it to the run's JSONL event log.
+
+        The JSONL file is an append-only event log, not a table: an upsert of an
+        already-saved trial appends a second line for the same trial id. Readers must
+        therefore take the *last* event per trial id; the SQLite row is the current value.
+        """
+        self.run_dir(trial.run_id).mkdir(parents=True, exist_ok=True)
+        with self._lock, self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO trials(id, run_id, idx, data) VALUES (?,?,?,?)",
                 (trial.id, trial.run_id, trial.index, trial.model_dump_json()),
@@ -109,9 +125,10 @@ class Ledger:
             f.write(json.dumps({"event": "trial", "trial": trial.model_dump(mode="json")}) + "\n")
 
     def trials(self, run_id: str) -> list[Trial]:
-        rows = self._conn.execute(
-            "SELECT data FROM trials WHERE run_id=? ORDER BY idx", (run_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT data FROM trials WHERE run_id=? ORDER BY idx, id", (run_id,)
+            ).fetchall()
         return [Trial.model_validate_json(r[0]) for r in rows]
 
     # ---- artifacts
@@ -122,4 +139,16 @@ class Ledger:
         return self.run_dir(run_id) / "trials.jsonl"
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
+
+    def __enter__(self) -> Ledger:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
