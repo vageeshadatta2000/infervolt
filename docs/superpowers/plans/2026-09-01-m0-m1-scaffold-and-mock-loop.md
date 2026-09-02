@@ -2449,7 +2449,9 @@ class EngineAdapter(ABC):
     def stop(self, handle: ServerHandle) -> ExitInfo: ...
 
     @abstractmethod
-    def to_recipe_block(self, cfg: EngineConfig, ctx: RunContext) -> tuple[dict[str, KnobValue], str]:
+    def to_recipe_block(
+        self, cfg: EngineConfig, ctx: RunContext
+    ) -> tuple[dict[str, KnobValue], str]:
         """(serve args, reproduction command)."""
 
     def classify_crash(self, exit: ExitInfo) -> CrashKind:
@@ -2615,12 +2617,45 @@ GRAPH_OVERHEAD_S = 0.0008
 PER_SEQ_OVERHEAD_S = 5e-6
 
 
+_TRUE_WORDS = frozenset({"true", "1", "yes"})
+_FALSE_WORDS = frozenset({"false", "0", "no"})
+
+
+def _as_bool(v: KnobValue) -> bool:
+    """Coerce a knob value to a bool, the way a CLI flag would be read.
+
+    ``bool()`` is wrong here: every non-empty string is truthy, so ``bool("false")``
+    is ``True`` and a knob set from YAML, JSON or a command line silently inverts.
+    Accepts real bools, the ints 0 and 1, and the usual word spellings in any case;
+    anything else raises rather than guessing.
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str):
+        word = v.strip().lower()
+        if word in _TRUE_WORDS:
+            return True
+        if word in _FALSE_WORDS:
+            return False
+    raise ValueError(f"cannot read {v!r} as a bool; use true/false, 1/0 or yes/no")
+
+
 class OomError(Exception):
     """Raised by check_launch when the config cannot fit."""
 
 
 @dataclass
 class SimPoint:
+    """Steady state at one closed-loop concurrency level.
+
+    Time fields are per request. ``lifetime_s`` is *service* time only -- the span from
+    admission to the last token, excluding time spent waiting to be admitted -- so a
+    request's end-to-end latency is ``queue_wait_s + lifetime_s``. ``ttft_s``, by
+    contrast, is measured from arrival and so already includes ``queue_wait_s``.
+    """
+
     concurrency: int
     running: int
     waiting: int
@@ -2659,44 +2694,75 @@ class PerfModel:
         need = roofline.weight_bytes(self.model) + roofline.reserve_bytes()
         if need > roofline.mem_bytes(self.hw) * self.util:
             raise OomError(
-                f"torch.OutOfMemoryError: CUDA out of memory. Tried to allocate {need / 1e9:.1f} GiB"
+                f"torch.OutOfMemoryError: CUDA out of memory. "
+                f"Tried to allocate {need / 2**30:.1f} GiB"
             )
         max_len = int(self.knobs["max_model_len"])
         if self.capacity < max_len:
             raise OomError(
-                f"ValueError: The model's max seq len ({max_len}) is larger than the maximum number "
-                f"of tokens that can be stored in KV cache ({int(self.capacity)})."
+                f"ValueError: The model's max seq len ({max_len}) is larger than the maximum "
+                f"number of tokens that can be stored in KV cache ({int(self.capacity)})."
             )
 
     # ---- steady state at one concurrency
     def _sched_overhead(self, n: int) -> float:
-        base = EAGER_OVERHEAD_S if bool(self.knobs["enforce_eager"]) else GRAPH_OVERHEAD_S
+        base = EAGER_OVERHEAD_S if _as_bool(self.knobs["enforce_eager"]) else GRAPH_OVERHEAD_S
         return base + PER_SEQ_OVERHEAD_S * n
+
+    def _spec_speedup(self) -> float:
+        name = str(self.knobs["speculative"])
+        try:
+            return SPEC_SPEEDUP[name]
+        except KeyError as e:
+            raise ValueError(
+                f"unknown speculative {name!r}; choices: {sorted(SPEC_SPEEDUP)}"
+            ) from e
 
     def point(self, concurrency: int) -> SimPoint:
         w, m = self.workload, self.model
         isl, osl = w.isl.p50, w.osl.p50
-        hit = w.prefix_share if bool(self.knobs["enable_prefix_caching"]) else 0.0
+        hit = w.prefix_share if _as_bool(self.knobs["enable_prefix_caching"]) else 0.0
         p_tokens = max(1, int(isl * (1 - hit)))
         max_seqs = int(self.knobs["max_num_seqs"])
         by_kv = int(self.capacity // isl) if self.capacity >= isl else 0
         n = max(0, min(concurrency, max_seqs, by_kv))
         if n == 0:
-            return SimPoint(concurrency, 0, concurrency, 0, 0, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0)
+            # Nothing runs. Either the KV cache cannot hold even one request -- a saturated
+            # server, which is what the diagnosis rules must see -- or there is simply
+            # nothing to run (concurrency 0, max_num_seqs 0), which is an idle one.
+            starved = by_kv == 0
+            return SimPoint(
+                concurrency=concurrency,
+                running=0,
+                waiting=max(0, concurrency),
+                queue_wait_s=0.0,
+                ttft_s=0.0,
+                prefill_s=0.0,
+                itl_mean_s=0.0,
+                itl_spike_s=0.0,
+                n_spikes=0,
+                lifetime_s=0.0,
+                step_floor_s=0.0,
+                kv_usage=1.0 if starved else 0.0,
+                preempt_frac=1.0 if starved else 0.0,
+                prefill_share=0.0,
+                sm_active=0.0,
+                dram_active=0.0,
+            )
         waiting = concurrency - n
         ctx = isl + osl // 2
         floor = roofline.decode_step_floor_s(self.hw_eff, m, n, ctx, self.kv_dtype_bytes)
         step = floor + self._sched_overhead(n)
         prefill = roofline.prefill_floor_s(self.hw_eff, m, p_tokens)
         per_tok = prefill / p_tokens
-        if bool(self.knobs["enable_chunked_prefill"]):
+        if _as_bool(self.knobs["enable_chunked_prefill"]):
             chunk = min(p_tokens, int(self.knobs["max_num_batched_tokens"]))
             n_chunks = math.ceil(p_tokens / chunk)
             ttft_core = prefill + n_chunks * step
             spike = chunk * per_tok
         else:
             ttft_core, spike = prefill, prefill
-        itl_mean = (step + (n - 1) * prefill / osl) / SPEC_SPEEDUP[str(self.knobs["speculative"])]
+        itl_mean = (step + (n - 1) * prefill / osl) / self._spec_speedup()
         need = n * (isl + osl)
         preempt_frac = max(0.0, (need - self.capacity) / self.capacity)
         lifetime_core = ttft_core + osl * itl_mean
@@ -2709,11 +2775,20 @@ class PerfModel:
         compute_time = n * prefill + osl * comp_part
         mem_time = osl * mem_part
         return SimPoint(
-            concurrency=concurrency, running=n, waiting=waiting, queue_wait_s=queue_wait,
-            ttft_s=queue_wait + ttft_core, prefill_s=prefill, itl_mean_s=itl_mean,
-            itl_spike_s=spike, n_spikes=min(osl, n - 1), lifetime_s=lifetime,
-            step_floor_s=floor, kv_usage=min(1.0, n * (isl + osl / 2) / self.capacity),
-            preempt_frac=preempt_frac, prefill_share=min(1.0, n * prefill / lifetime_core),
+            concurrency=concurrency,
+            running=n,
+            waiting=waiting,
+            queue_wait_s=queue_wait,
+            ttft_s=queue_wait + ttft_core,
+            prefill_s=prefill,
+            itl_mean_s=itl_mean,
+            itl_spike_s=spike,
+            n_spikes=min(osl, n - 1),
+            lifetime_s=lifetime,
+            step_floor_s=floor,
+            kv_usage=min(1.0, n * (isl + osl / 2) / self.capacity),
+            preempt_frac=preempt_frac,
+            prefill_share=min(1.0, n * prefill / lifetime_core),
             sm_active=min(1.0, compute_time / lifetime_core),
             dram_active=min(1.0, mem_time / lifetime_core),
         )
@@ -2819,19 +2894,34 @@ from __future__ import annotations
 import numpy as np
 
 from infervolt.core.types import (
-    EngineConfig, Knob, KnobSpace, KnobValue, LoadResult, RequestRecord, RunContext, Workload,
+    EngineConfig,
+    Knob,
+    KnobSpace,
+    KnobValue,
+    LoadResult,
+    RequestRecord,
+    RunContext,
+    Workload,
 )
 from infervolt.engines.base import EngineAdapter, EngineVersion, ExitInfo, LaunchError, ServerHandle
-from infervolt.engines.mock.model import DEFAULT_KNOBS, OomError, PerfModel, SimPoint
+from infervolt.engines.mock.model import DEFAULT_KNOBS, OomError, PerfModel, SimPoint, _as_bool
 from infervolt.loadgen.base import LoadGenerator
 
 NOISE = 0.03
+MAX_MODEL_LEN_CHOICES: list[KnobValue] = [4096, 8192, 16384, 32768]
 
 
 class MockState:
     def __init__(self, pm: PerfModel) -> None:
         self.pm = pm
         self.last: SimPoint | None = None
+
+
+def _state(handle: ServerHandle) -> MockState:
+    """Narrow ``ServerHandle.state``, which is deliberately ``Any`` in the base contract."""
+    st = handle.state
+    assert isinstance(st, MockState), f"handle was not produced by MockAdapter.launch: {st!r}"
+    return st
 
 
 class SimLoadGenerator:
@@ -2845,8 +2935,14 @@ class SimLoadGenerator:
         rng = np.random.default_rng(seed * 1000 + concurrency)
         osl = workload.osl.p50
         if p.running == 0:
-            reqs = [RequestRecord(ttft_s=0.0, itl_s=[], output_tokens=0, ok=False) for _ in range(num_requests)]
-            return LoadResult(concurrency=concurrency, duration_s=1.0, requests=reqs)
+            # Nothing was admitted, so nothing completed. duration_s still has to be
+            # positive -- every rate in compute_metrics divides by it -- and one second
+            # of a fully failed run is as good a stand-in as any.
+            failed = [
+                RequestRecord(ttft_s=0.0, itl_s=[], output_tokens=0, ok=False)
+                for _ in range(num_requests)
+            ]
+            return LoadResult(concurrency=concurrency, duration_s=1.0, requests=failed)
         base_itl = max(p.step_floor_s * 0.5, p.itl_mean_s - p.n_spikes * p.itl_spike_s / osl)
         reqs: list[RequestRecord] = []
         for _ in range(num_requests):
@@ -2855,7 +2951,13 @@ class SimLoadGenerator:
             if p.n_spikes:
                 idx = rng.choice(osl, size=p.n_spikes, replace=False)
                 itl[idx] += p.itl_spike_s
-            reqs.append(RequestRecord(ttft_s=float(max(ttft, 1e-4)), itl_s=[float(x) for x in itl], output_tokens=osl))
+            reqs.append(
+                RequestRecord(
+                    ttft_s=float(max(ttft, 1e-4)),
+                    itl_s=[float(x) for x in itl],
+                    output_tokens=osl,
+                )
+            )
         duration = num_requests * (p.lifetime_s + p.queue_wait_s) / p.running
         return LoadResult(concurrency=concurrency, duration_s=float(duration), requests=reqs)
 
@@ -2866,25 +2968,114 @@ class MockAdapter(EngineAdapter):
     def version(self) -> EngineVersion:
         return EngineVersion(name="mock", version="1.0", commit="sim")
 
+    @staticmethod
+    def _default_max_model_len(ctx: RunContext) -> KnobValue:
+        """Shortest offered context that still covers the workload.
+
+        The baseline config has to launch, and both ``validate`` (which rejects a
+        max_model_len below the workload) and ``PerfModel.check_launch`` (which rejects
+        one the KV cache cannot hold) get a say. Picking the smallest sufficient choice
+        satisfies the first and gives the second the most headroom.
+        """
+        need = ctx.workload.isl.p99 + ctx.workload.osl.p50
+        for choice in MAX_MODEL_LEN_CHOICES:
+            if isinstance(choice, int) and choice >= need:
+                return choice
+        return MAX_MODEL_LEN_CHOICES[-1]
+
     def knob_space(self, ctx: RunContext) -> KnobSpace:
         d = DEFAULT_KNOBS
         return KnobSpace(
             knobs=[
-                Knob(name="max_num_seqs", kind="int", groups=["kv", "decode", "sched"], default=d["max_num_seqs"], low=8, high=1024, log=True),
-                Knob(name="max_num_batched_tokens", kind="int", groups=["prefill"], default=d["max_num_batched_tokens"], low=512, high=16384, log=True),
-                Knob(name="gpu_memory_utilization", kind="float", groups=["kv"], default=d["gpu_memory_utilization"], low=0.7, high=0.95, step=0.05),
-                Knob(name="max_model_len", kind="cat", groups=["kv"], default=d["max_model_len"], choices=[4096, 8192, 16384, 32768]),
-                Knob(name="enable_prefix_caching", kind="bool", groups=["kv"], default=d["enable_prefix_caching"]),
-                Knob(name="enable_chunked_prefill", kind="bool", groups=["prefill"], default=d["enable_chunked_prefill"]),
-                Knob(name="kv_cache_dtype", kind="cat", groups=["kv", "decode"], default=d["kv_cache_dtype"], choices=["auto", "fp8"]),
-                Knob(name="enforce_eager", kind="bool", groups=["sched"], default=d["enforce_eager"]),
-                Knob(name="speculative", kind="cat", groups=["decode"], default=d["speculative"], choices=["none", "ngram", "eagle3"]),
-                Knob(name="quantization", kind="cat", groups=["prefill", "decode"], default=d["quantization"], choices=["none", "fp8"]),
+                Knob(
+                    name="max_num_seqs",
+                    kind="int",
+                    groups=["kv", "decode", "sched"],
+                    default=d["max_num_seqs"],
+                    low=8,
+                    high=1024,
+                    log=True,
+                ),
+                Knob(
+                    name="max_num_batched_tokens",
+                    kind="int",
+                    groups=["prefill"],
+                    default=d["max_num_batched_tokens"],
+                    low=512,
+                    high=16384,
+                    log=True,
+                ),
+                Knob(
+                    name="gpu_memory_utilization",
+                    kind="float",
+                    groups=["kv"],
+                    default=d["gpu_memory_utilization"],
+                    low=0.7,
+                    high=0.95,
+                    step=0.05,
+                ),
+                Knob(
+                    name="max_model_len",
+                    kind="cat",
+                    groups=["kv"],
+                    default=self._default_max_model_len(ctx),
+                    choices=MAX_MODEL_LEN_CHOICES,
+                ),
+                Knob(
+                    name="enable_prefix_caching",
+                    kind="bool",
+                    groups=["kv"],
+                    default=d["enable_prefix_caching"],
+                ),
+                Knob(
+                    name="enable_chunked_prefill",
+                    kind="bool",
+                    groups=["prefill"],
+                    default=d["enable_chunked_prefill"],
+                ),
+                Knob(
+                    name="kv_cache_dtype",
+                    kind="cat",
+                    groups=["kv", "decode"],
+                    default=d["kv_cache_dtype"],
+                    choices=["auto", "fp8"],
+                ),
+                Knob(
+                    name="enforce_eager", kind="bool", groups=["sched"], default=d["enforce_eager"]
+                ),
+                Knob(
+                    name="speculative",
+                    kind="cat",
+                    groups=["decode"],
+                    default=d["speculative"],
+                    choices=["none", "ngram", "eagle3"],
+                ),
+                Knob(
+                    name="quantization",
+                    kind="cat",
+                    groups=["prefill", "decode"],
+                    default=d["quantization"],
+                    choices=["none", "fp8"],
+                ),
             ]
         )
 
     def validate(self, cfg: EngineConfig, ctx: RunContext) -> list[str]:
         errs: list[str] = []
+        for knob in self.knob_space(ctx).knobs:
+            if knob.name not in cfg.knobs:
+                continue
+            value = cfg.knobs[knob.name]
+            if knob.kind == "cat" and value not in knob.choices:
+                errs.append(f"{knob.name}={value!r} is not one of {knob.choices!r}")
+            elif knob.kind == "bool":
+                try:
+                    _as_bool(value)
+                except ValueError:
+                    errs.append(
+                        f"{knob.name}={value!r} is not a bool; "
+                        f"choices: ['true', 'false', '1', '0', 'yes', 'no']"
+                    )
         if cfg.knobs.get("quantization") == "fp8" and ctx.hw.compute_capability < 8.9:
             errs.append("fp8 quantization needs compute capability >= 8.9")
         if int(cfg.knobs.get("max_model_len", 32768)) < ctx.workload.isl.p99 + ctx.workload.osl.p50:
@@ -2903,16 +3094,16 @@ class MockAdapter(EngineAdapter):
         return True
 
     def loadgen(self, handle: ServerHandle, ctx: RunContext) -> LoadGenerator:
-        return SimLoadGenerator(handle.state)
+        return SimLoadGenerator(_state(handle))
 
     def scrape(self, handle: ServerHandle) -> dict[str, float]:
-        st: MockState = handle.state
+        st = _state(handle)
         p = st.last
         if p is None:
             return {}
         w = st.pm.workload
         rate = p.running / p.lifetime_s if p.lifetime_s > 0 else 0.0
-        hit = w.prefix_share if bool(st.pm.knobs["enable_prefix_caching"]) else 0.0
+        hit = w.prefix_share if _as_bool(st.pm.knobs["enable_prefix_caching"]) else 0.0
         return {
             "kv_usage_p95": p.kv_usage,
             "num_waiting": float(p.waiting),
@@ -2927,20 +3118,26 @@ class MockAdapter(EngineAdapter):
         }
 
     def gpu_stats(self, handle: ServerHandle) -> dict[str, float]:
-        p = handle.state.last
+        p = _state(handle).last
         return {"sm_active": p.sm_active, "dram_active": p.dram_active} if p else {}
 
     def stop(self, handle: ServerHandle) -> ExitInfo:
         return ExitInfo(code=0)
 
-    def to_recipe_block(self, cfg: EngineConfig, ctx: RunContext) -> tuple[dict[str, KnobValue], str]:
+    def to_recipe_block(
+        self, cfg: EngineConfig, ctx: RunContext
+    ) -> tuple[dict[str, KnobValue], str]:
         flags = " ".join(f"--{k.replace('_', '-')} {v}" for k, v in sorted(cfg.knobs.items()))
         return dict(cfg.knobs), f"mock-serve {ctx.model.id} {flags}"
 ```
 
 `src/infervolt/engines/mock/scenarios.py`:
 ```python
-"""Injected-bottleneck scenarios. Used by tests and by the README demo."""
+"""Injected-bottleneck scenarios. Used by tests and by the README demo.
+
+Each entry pins hardware, model and workload so that exactly one bottleneck dominates:
+the diagnosis rules are expected to name ``expected`` when run against it.
+"""
 
 from __future__ import annotations
 
@@ -2964,19 +3161,59 @@ class Scenario:
 
 
 SCENARIOS: dict[str, Scenario] = {
-    "kv": Scenario("kv", "rtx4090-24", "mock/qwen3-8b", "chat-4k-512", "ttft=600ms,itl=30ms", "kv_capacity"),
-    "decode": Scenario("decode", "a100-80", "mock/qwen3-8b", "chat-256-512", "ttft=300ms,itl=30ms", "decode_bandwidth"),
-    "prefill": Scenario("prefill", "h100-80", "mock/qwen3-8b", "rag-16k-64", "ttft=1500ms,itl=50ms", "prefill_compute"),
-    "sched": Scenario("sched", "a100-80", "mock/qwen3-0.6b", "chat-1k-128", "ttft=200ms,itl=5ms", "scheduler_cpu",
-                      baseline={"enforce_eager": True}),
+    "kv": Scenario(
+        name="kv",
+        hardware="rtx4090-24",
+        model="mock/qwen3-8b",
+        workload="chat-4k-512",
+        slo="ttft=600ms,itl=30ms",
+        expected="kv_capacity",
+    ),
+    "decode": Scenario(
+        name="decode",
+        hardware="a100-80",
+        model="mock/qwen3-8b",
+        workload="chat-256-512",
+        slo="ttft=300ms,itl=30ms",
+        expected="decode_bandwidth",
+    ),
+    "prefill": Scenario(
+        name="prefill",
+        hardware="h100-80",
+        model="mock/qwen3-8b",
+        workload="rag-16k-64",
+        slo="ttft=1500ms,itl=50ms",
+        expected="prefill_compute",
+    ),
+    "sched": Scenario(
+        name="sched",
+        hardware="a100-80",
+        model="mock/qwen3-0.6b",
+        workload="chat-1k-128",
+        slo="ttft=200ms,itl=5ms",
+        expected="scheduler_cpu",
+        baseline={"enforce_eager": True},
+    ),
 }
 
 
+def get_scenario(name: str) -> Scenario:
+    try:
+        return SCENARIOS[name]
+    except KeyError as e:
+        raise KeyError(f"unknown scenario {name!r}; known: {sorted(SCENARIOS)}") from e
+
+
 def make_context(name: str, run_dir: str, run_id: str = "test", seed: int = 7) -> RunContext:
-    s = SCENARIOS[name]
+    s = get_scenario(name)
     return RunContext(
-        run_id=run_id, run_dir=run_dir, hw=get_profile(s.hardware), model=get_model_info(s.model),
-        workload=get_workload(s.workload), slo=parse_slo(s.slo), seed=seed,
+        run_id=run_id,
+        run_dir=run_dir,
+        hw=get_profile(s.hardware),
+        model=get_model_info(s.model),
+        workload=get_workload(s.workload),
+        slo=parse_slo(s.slo),
+        seed=seed,
     )
 ```
 
