@@ -19,7 +19,7 @@ from infervolt.engines.mock.model import DEFAULT_KNOBS, OomError, PerfModel, Sim
 from infervolt.loadgen.base import LoadGenerator
 
 NOISE = 0.03
-MAX_MODEL_LEN_CHOICES: list[KnobValue] = [4096, 8192, 16384, 32768]
+MAX_MODEL_LEN_CHOICES: tuple[int, ...] = (4096, 8192, 16384, 32768)
 INT_KNOBS = frozenset({"max_num_seqs", "max_num_batched_tokens"})
 
 
@@ -35,7 +35,7 @@ def _as_number(value: KnobValue) -> float | None:
         return float(value)
     try:
         return float(value)
-    except ValueError:
+    except (ValueError, TypeError):
         return None
 
 
@@ -105,7 +105,7 @@ class MockAdapter(EngineAdapter):
         return EngineVersion(name="mock", version="1.0", commit="sim")
 
     @staticmethod
-    def _default_max_model_len(ctx: RunContext) -> KnobValue:
+    def _default_max_model_len(ctx: RunContext) -> int:
         """Shortest offered context that still covers the workload.
 
         This is workload-aware, not hardware-aware: it looks only at the workload's
@@ -117,7 +117,7 @@ class MockAdapter(EngineAdapter):
         """
         need = ctx.workload.isl.p99 + ctx.workload.osl.p50
         for choice in MAX_MODEL_LEN_CHOICES:
-            if isinstance(choice, int) and choice >= need:
+            if choice >= need:
                 return choice
         return MAX_MODEL_LEN_CHOICES[-1]
 
@@ -157,7 +157,7 @@ class MockAdapter(EngineAdapter):
                     kind="cat",
                     groups=["kv"],
                     default=self._default_max_model_len(ctx),
-                    choices=MAX_MODEL_LEN_CHOICES,
+                    choices=list(MAX_MODEL_LEN_CHOICES),
                 ),
                 Knob(
                     name="enable_prefix_caching",

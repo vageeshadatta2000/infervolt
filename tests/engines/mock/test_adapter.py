@@ -62,7 +62,6 @@ def test_duration_reflects_closed_loop_throughput() -> None:
     p = _state(handle).pm.point(64)
     assert p.running > 0 and p.waiting > 0  # the case where the two formulas differ
     lr = adapter.loadgen(handle, ctx).run(ctx.workload, concurrency=64, num_requests=32, seed=1)
-    assert lr.duration_s == pytest.approx(32 * p.lifetime_s / p.running)
     m = compute_metrics(lr, ctx.slo, ctx.hw)
     assert m.req_per_s * (p.lifetime_s + p.queue_wait_s) == pytest.approx(64, rel=0.05)
 

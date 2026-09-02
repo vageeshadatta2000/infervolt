@@ -332,6 +332,14 @@ TrialStatus = Literal[
     "pending", "running", "ok", "infeasible_oom", "crash", "timeout", "pruned", "rejected"
 ]
 CrashKind = Literal["none", "oom", "startup", "runtime", "timeout"]
+"""How a trial died.
+
+``"startup"`` means the launch failed *outside* the engine's own exit path -- an adapter
+contract violation, such as a Python exception escaping ``launch`` instead of a
+``LaunchError``. ``"runtime"`` means the engine or the load phase died once launch had
+succeeded. ``"oom"`` is an out-of-memory death at any point, ``"timeout"`` a server that
+never became ready, and ``"none"`` a trial that did not crash at all.
+"""
 
 
 class Trial(BaseModel):

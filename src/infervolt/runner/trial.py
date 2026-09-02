@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 
 from infervolt.core.types import EngineConfig, Observation, Result, RunContext, Trial
-from infervolt.engines.base import EngineAdapter, LaunchError, ServerHandle
+from infervolt.engines.base import EngineAdapter, ExitInfo, LaunchError, ServerHandle
 from infervolt.loadgen.analysis import compute_metrics
 
 # Above any of these the load generator, not the server, is the thing being measured.
@@ -123,16 +123,29 @@ def run_candidate(
             trial.status, trial.crash_kind = "timeout", "timeout"
             return trial
         obs, load_s = run_sweep(adapter, handle, ctx, concurrencies, num_requests)
+        # Billed here, before the exit is classified: the GPU-hours were spent whatever
+        # the server's exit code turns out to say.
+        # M2: bill startup/ready time too (vLLM startup is minutes)
+        trial.cost_usd = ctx.hw.usd_per_hour * ctx.hw.count / 3600.0 * load_s
+    except Exception as e:  # noqa: BLE001 - a failed trial, not a failed run
+        # Anything from ready() or the sweep -- an adapter bug, a dead socket, a client
+        # library blowing up -- is this candidate's result, not the caller's problem.
+        trial.status, trial.crash_kind = "crash", "runtime"
+        trial.log_tail = f"{type(e).__name__}: {e}"
+        return trial
     finally:
-        exit_info = adapter.stop(handle)
+        try:
+            exit_info = adapter.stop(handle)
+        except Exception as e:  # noqa: BLE001 - teardown must not mask the trial's result
+            exit_info = ExitInfo(code=1, log_tail=f"stop() failed: {type(e).__name__}: {e}")
         trial.ended = time.time()
     kind = adapter.classify_crash(exit_info)
     if kind != "none":
-        # The server died during the sweep; the numbers it produced cannot be trusted.
+        # The server died during the sweep; the numbers it produced cannot be trusted,
+        # though the time it burned still counts.
         trial.crash_kind, trial.log_tail = kind, exit_info.log_tail[-2000:]
         trial.status = "infeasible_oom" if kind == "oom" else "crash"
         return trial
-    trial.cost_usd = ctx.hw.usd_per_hour * ctx.hw.count / 3600.0 * load_s
     trial.result = summarize(obs, ctx)
     trial.status = "ok"
     return trial
@@ -142,14 +155,17 @@ def summarize(obs: list[Observation], ctx: RunContext) -> Result:
     """Pick the load point with the highest goodput and score the candidate by it.
 
     Invalid observations are excluded from the choice but kept in ``observations``: the
-    diagnosis rules want to see the point where the sweep stopped and why.
+    diagnosis rules want to see the point where the sweep stopped and why. A sweep that
+    produced no valid observation measured nothing, so the candidate is infeasible --
+    scoring it 0.0 and calling it feasible would let the search treat a config that
+    never served a request as a merely bad one.
     """
     valid = [o for o in obs if o.valid]
     if not valid:
         return Result(
             observations=obs,
             objective=0.0,
-            feasible=True,
+            feasible=False,
             slo_met=False,
             best_load_point=obs[0].load_point if obs else 0,
         )
