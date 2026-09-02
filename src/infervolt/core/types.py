@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Literal
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 KnobValue = int | float | str | bool
 
@@ -209,6 +209,10 @@ class LoadResult(BaseModel):
 
 
 class Metrics(BaseModel):
+    # ``usd_per_m_tokens`` is infinite for a run with no output tokens; the default JSON
+    # serialiser turns inf into null, which fails to validate back, so encode it as a string.
+    model_config = ConfigDict(ser_json_inf_nan="strings")
+
     ttft_p50_ms: float
     ttft_p90_ms: float
     ttft_p99_ms: float

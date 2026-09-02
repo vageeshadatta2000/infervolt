@@ -1,6 +1,8 @@
+import math
 import typing
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from infervolt.core.types import (
@@ -10,6 +12,7 @@ from infervolt.core.types import (
     EngineConfig,
     Knob,
     KnobSpace,
+    Metrics,
     RequestRecord,
 )
 
@@ -123,3 +126,35 @@ def test_bool_knob_requires_bool_default() -> None:
 def test_zero_low_bound_is_accepted() -> None:
     knob = Knob(name="a", kind="int", groups=["kv"], default=0, low=0, high=8)
     assert knob.low == 0
+
+
+def _inf_metrics() -> Metrics:
+    """A metrics row from a run that produced no output tokens, so cost is infinite."""
+    return Metrics(
+        ttft_p50_ms=0.0,
+        ttft_p90_ms=0.0,
+        ttft_p99_ms=0.0,
+        itl_p50_ms=0.0,
+        itl_p90_ms=0.0,
+        itl_p99_ms=0.0,
+        e2e_p50_ms=0.0,
+        e2e_p90_ms=0.0,
+        output_tps=0.0,
+        req_per_s=0.0,
+        goodput_rps=0.0,
+        goodput_frac=0.0,
+        error_rate=1.0,
+        tokens_per_s_per_gpu=0.0,
+        usd_per_m_tokens=math.inf,
+    )
+
+
+def test_metrics_json_roundtrip_preserves_infinite_cost() -> None:
+    m = _inf_metrics()
+    assert Metrics.model_validate_json(m.model_dump_json()).usd_per_m_tokens == math.inf
+
+
+def test_metrics_yaml_roundtrip_preserves_infinite_cost() -> None:
+    m = _inf_metrics()
+    again = yaml.safe_load(yaml.safe_dump(m.model_dump(mode="json")))
+    assert Metrics.model_validate(again).usd_per_m_tokens == math.inf

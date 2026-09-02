@@ -22,7 +22,7 @@ def test_weight_and_kv_bytes() -> None:
 def test_memory_basis_is_gibibytes() -> None:
     hw = get_profile("a100-80")
     assert roofline.mem_bytes(hw) == 80 * 2**30
-    assert roofline.reserve_bytes() == roofline.ACTIVATION_RESERVE_GB * 2**30
+    assert roofline.reserve_bytes() == roofline.ACTIVATION_RESERVE_GIB * 2**30
 
 
 def test_active_params_prefers_the_active_parameter_count() -> None:
@@ -68,7 +68,9 @@ def test_long_prefill_pays_quadratic_attention_on_top_of_the_linear_term() -> No
     hw, m = get_profile("a100-80"), _qwen8b()
     tokens = 16384
     linear_only_s = 2.0 * roofline.active_params(m) * tokens / (hw.peak_tflops * 1e12)
-    assert roofline.prefill_floor_s(hw, m, tokens) > 1.3 * linear_only_s
+    # Causal attention adds tokens * hidden * layers / active_params = 16384 * 4096 * 36 / 8.2e9
+    # = 0.2946 of the linear term, so the floor is ~1.295x the linear-only value.
+    assert roofline.prefill_floor_s(hw, m, tokens) > 1.29 * linear_only_s
 
 
 @pytest.mark.parametrize(

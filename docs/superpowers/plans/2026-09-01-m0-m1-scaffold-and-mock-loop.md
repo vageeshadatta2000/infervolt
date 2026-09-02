@@ -955,7 +955,7 @@ from __future__ import annotations
 
 from infervolt.core.types import HardwareProfile, ModelInfo
 
-ACTIVATION_RESERVE_GB = 2.0
+ACTIVATION_RESERVE_GIB = 2.0
 
 
 def mem_bytes(hw: HardwareProfile) -> float:
@@ -965,7 +965,7 @@ def mem_bytes(hw: HardwareProfile) -> float:
 
 def reserve_bytes() -> float:
     """Bytes held back for activations and fragmentation, i.e. not available for KV."""
-    return ACTIVATION_RESERVE_GB * 2**30
+    return ACTIVATION_RESERVE_GIB * 2**30
 
 
 def weight_bytes(m: ModelInfo) -> float:

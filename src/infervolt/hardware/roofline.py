@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from infervolt.core.types import HardwareProfile, ModelInfo
 
-ACTIVATION_RESERVE_GB = 2.0
+ACTIVATION_RESERVE_GIB = 2.0
 
 
 def mem_bytes(hw: HardwareProfile) -> float:
@@ -29,7 +29,7 @@ def mem_bytes(hw: HardwareProfile) -> float:
 
 def reserve_bytes() -> float:
     """Bytes held back for activations and fragmentation, i.e. not available for KV."""
-    return ACTIVATION_RESERVE_GB * 2**30
+    return ACTIVATION_RESERVE_GIB * 2**30
 
 
 def weight_bytes(m: ModelInfo) -> float:
@@ -66,9 +66,11 @@ def prefill_floor_s(hw: HardwareProfile, m: ModelInfo, tokens: int) -> float:
 
     * ``linear`` -- ``2 * active_params * tokens`` FLOPs: one multiply-add per active
       parameter per token through the dense/expert projections.
-    * ``attn`` -- ``4 * tokens**2 * hidden * num_layers`` FLOPs: the quadratic
+    * ``attn`` -- ``2 * tokens**2 * hidden * num_layers`` FLOPs: the quadratic
       score-and-weighted-sum pair (two matmuls, 2 FLOPs each) that the linear term
-      ignores. Negligible at short context, dominant at long context.
+      ignores, halved because inference attention is causal -- only the lower triangle
+      of the tokens x tokens score matrix is computed, so the full ``4 * L**2`` figure
+      overstates the work by 2x. Negligible at short context, dominant at long context.
     * the weight stream -- ``weight_bytes / hbm_bw``: even a one-token prefill must read
       every weight out of HBM once.
 
@@ -78,7 +80,7 @@ def prefill_floor_s(hw: HardwareProfile, m: ModelInfo, tokens: int) -> float:
     if tokens <= 0:
         raise ValueError(f"tokens must be positive, got {tokens!r}")
     linear = 2.0 * active_params(m) * tokens
-    attn = 4.0 * tokens**2 * m.hidden * m.num_layers
+    attn = 2.0 * tokens**2 * m.hidden * m.num_layers
     t_compute = (linear + attn) / (hw.peak_tflops * 1e12)
     t_mem = weight_bytes(m) / (hw.hbm_bw_gbs * 1e9)
     return max(t_compute, t_mem)
