@@ -22,8 +22,16 @@ class EngineVersion(BaseModel):
 
 @dataclass
 class ServerHandle:
+    """A running server, plus whatever the adapter needs to talk to it.
+
+    ``config`` is the config the server was actually launched with. The runner sets it
+    after a successful launch so that every observation taken through this handle can
+    record what produced it, without threading the config through each call.
+    """
+
     url: str
     state: Any = None
+    config: EngineConfig | None = None
 
 
 @dataclass
