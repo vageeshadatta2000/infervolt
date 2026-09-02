@@ -10,9 +10,14 @@ import yaml
 from pydantic import ValidationError
 
 from infervolt import __version__
+from infervolt.config import Settings
+from infervolt.core.types import Budget, KnobValue, OptimizeSpec
 from infervolt.recipes.schema import Recipe
+from infervolt.workloads.presets import parse_slo
 
 app = typer.Typer(help="Measure, diagnose, fix, verify, and remember LLM inference optimizations.")
+
+HOME_HELP = "State directory holding the ledger and run artifacts (default ~/.infervolt)."
 
 
 def _version_callback(value: bool) -> None:
@@ -32,6 +37,90 @@ def main(
 
 recipe_app = typer.Typer(help="Recipe utilities.")
 app.add_typer(recipe_app, name="recipe")
+
+
+def _settings(home: Path | None) -> Settings:
+    return Settings(home=home) if home else Settings()
+
+
+def _parse_kv(items: list[str]) -> dict[str, KnobValue]:
+    """Parse ``k=v`` overrides, narrowing each value to the tightest type it parses as.
+
+    Order matters: ``true``/``false`` before numbers (Python would read ``True`` as 1),
+    ints before floats (``64`` is a sequence count, not 64.0), and anything left is a
+    string -- which is what categorical knobs such as ``kv_cache_dtype=fp8`` want.
+    """
+    out: dict[str, KnobValue] = {}
+    for item in items:
+        k, _, v = item.partition("=")
+        if v.lower() in ("true", "false"):
+            out[k] = v.lower() == "true"
+            continue
+        try:
+            out[k] = int(v)
+        except ValueError:
+            try:
+                out[k] = float(v)
+            except ValueError:
+                out[k] = v
+    return out
+
+
+@app.command()
+def optimize(
+    engine: str = typer.Option("mock", help="Engine adapter name (see entry points)."),
+    model: str = typer.Option(..., help="Model id, e.g. mock/qwen3-8b"),
+    hardware: str = typer.Option(
+        "auto", help="Hardware profile (a100-80, h100-80, rtx4090-24, l4-24, m3-8)."
+    ),
+    workload: str = typer.Option("chat-4k-512", help="Workload preset."),
+    slo: str = typer.Option("", help="SLO string, e.g. ttft=500ms,itl=30ms[,e2e=2s,p=0.9]"),
+    llm: str = typer.Option("fake", help="fake | anthropic | openai"),
+    max_trials: int = typer.Option(12, help="Trial budget for the search."),
+    max_wall_s: float = typer.Option(3600.0, help="Wall-clock budget in seconds."),
+    max_usd: float = typer.Option(0.0, help="Cost budget in USD; 0 means unlimited."),
+    seed: int = typer.Option(7, help="Sampler and load-generator seed."),
+    baseline: Annotated[
+        list[str] | None,
+        typer.Option("--baseline", help="Baseline knob override k=v (repeatable)."),
+    ] = None,
+    home: Annotated[Path | None, typer.Option(help=HOME_HELP)] = None,
+) -> None:
+    """Run the full loop and emit a recipe."""
+    from infervolt.agent.planner import Planner
+    from infervolt.llm.factory import make_llm
+    from infervolt.store.ledger import Ledger
+
+    settings = _settings(home)
+    spec = OptimizeSpec(
+        engine=engine,
+        model=model,
+        hardware=hardware,
+        workload=workload,
+        slo=parse_slo(slo),
+        budget=Budget(max_trials=max_trials, max_wall_s=max_wall_s, max_usd=max_usd),
+        baseline=_parse_kv(baseline or []),
+        seed=seed,
+        llm=llm,
+    )
+    with Ledger(settings.ledger_path, settings.runs_dir) as ledger:
+        outcome = Planner(spec, settings, make_llm(llm, settings), ledger, log=typer.echo).run()
+    if outcome.state != "done":
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def report(
+    run_id: str,
+    home: Annotated[Path | None, typer.Option(help=HOME_HELP)] = None,
+) -> None:
+    """Print the report for a run."""
+    settings = _settings(home)
+    path = settings.runs_dir / run_id / "report.md"
+    if not path.exists():
+        typer.echo(f"no report for run {run_id}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(path.read_text())
 
 
 @recipe_app.command("validate")
