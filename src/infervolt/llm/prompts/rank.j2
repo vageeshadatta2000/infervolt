@@ -1,0 +1,11 @@
+Rank the bottleneck findings for this serving run.
+
+The deterministic rules already scored each finding from evidence. Your job: choose the PRIMARY
+bottleneck (the one that caps goodput under the SLO first), order the rest, explain in <=120 words
+citing evidence keys, and list caveats (e.g. measurement artifacts, low load). Use only rule ids
+present in the context. Output schema: {"primary_rule_id", "ranked_rule_ids", "rationale",
+"confidence" (0-1), "caveats"}.
+
+<context>
+{{ context_json }}
+</context>
