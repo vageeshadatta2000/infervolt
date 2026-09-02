@@ -1,6 +1,9 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import anthropic
+import openai
 import pytest
 
 from infervolt.config import Settings
@@ -34,6 +37,47 @@ def test_anthropic_client_uses_messages_parse() -> None:
     assert call["model"] == "claude-opus-5"
     assert call["output_format"] is DiagnosisOut
     assert call["system"] == "s"
+
+
+class _AnthropicBoom(anthropic.APIError):
+    """A real ``anthropic.APIError`` subclass, built without the SDK's constructor."""
+
+    def __init__(self) -> None:
+        Exception.__init__(self, "upstream exploded")
+
+
+class _RaisingAnthropicStub:
+    def __init__(self, exc: BaseException) -> None:
+        self.messages = SimpleNamespace(parse=self._parse)
+        self.exc = exc
+
+    def _parse(self, **kw):  # type: ignore[no-untyped-def]
+        raise self.exc
+
+
+def test_anthropic_provider_error_becomes_llm_error() -> None:
+    stub = _RaisingAnthropicStub(_AnthropicBoom())
+    with pytest.raises(LLMError) as excinfo:
+        AnthropicClient(client=stub).structured(system="s", user="u", schema=DiagnosisOut)
+    assert "anthropic: _AnthropicBoom" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, anthropic.APIError)
+
+
+def test_anthropic_non_provider_error_is_not_swallowed() -> None:
+    with pytest.raises(RuntimeError):
+        AnthropicClient(client=_RaisingAnthropicStub(RuntimeError("bug"))).structured(
+            system="s", user="u", schema=DiagnosisOut
+        )
+
+
+def test_anthropic_missing_parsed_output_raises() -> None:
+    class _NoneStub:
+        messages = SimpleNamespace(
+            parse=lambda **kw: SimpleNamespace(parsed_output=None, stop_reason="end_turn")
+        )
+
+    with pytest.raises(LLMError):
+        AnthropicClient(client=_NoneStub()).structured(system="s", user="u", schema=DiagnosisOut)
 
 
 def test_anthropic_refusal_raises() -> None:
@@ -71,6 +115,37 @@ def test_openai_compat_gives_up_after_two_failures() -> None:
         )
 
 
+class _OpenAIBoom(openai.APIError):
+    """A real ``openai.APIError`` subclass, built without the SDK's constructor."""
+
+    def __init__(self) -> None:
+        Exception.__init__(self, "upstream exploded")
+
+
+def test_openai_provider_error_becomes_llm_error() -> None:
+    class _RaisingOpenAIStub:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, **kw):  # type: ignore[no-untyped-def]
+            raise _OpenAIBoom()
+
+    with pytest.raises(LLMError) as excinfo:
+        OpenAICompatClient(model_id="m", client=_RaisingOpenAIStub()).structured(
+            system="s", user="u", schema=DiagnosisOut
+        )
+    assert "openai: _OpenAIBoom" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, openai.APIError)
+
+
+def test_openai_compat_extracts_json_from_prose_on_first_call() -> None:
+    stub = _OpenAIStub(["Here is the JSON:\n```json\n" + GOOD.model_dump_json() + "\n```"])
+    out = OpenAICompatClient(model_id="m", client=stub).structured(
+        system="s", user="u", schema=DiagnosisOut
+    )
+    assert out == GOOD and len(stub.calls) == 1
+
+
 def test_replay_records_then_replays(tmp_path: Path) -> None:
     path = tmp_path / "cassette.json"
     stub = _AnthropicStub()
@@ -80,6 +155,18 @@ def test_replay_records_then_replays(tmp_path: Path) -> None:
     assert replay.structured(system="s", user="u", schema=DiagnosisOut) == GOOD
     with pytest.raises(LLMError):
         replay.structured(system="s", user="different", schema=DiagnosisOut)
+    entry = next(iter(json.loads(path.read_text()).values()))
+    assert entry["model_id"] == "claude-opus-5"
+    assert entry["data"]["primary_rule_id"] == "R1"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_replay_reads_legacy_cassettes_without_model_id(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.json"
+    key = ReplayLLMClient._key("s", "u", DiagnosisOut)
+    path.write_text(json.dumps({key: GOOD.model_dump(mode="json")}))
+    replay = ReplayLLMClient(path, inner=None)
+    assert replay.structured(system="s", user="u", schema=DiagnosisOut) == GOOD
 
 
 def test_factory(tmp_path: Path) -> None:

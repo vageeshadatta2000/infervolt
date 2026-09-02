@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+from functools import cache
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -9,6 +11,28 @@ from pydantic import BaseModel
 from infervolt.llm.base import LLMError
 
 T = TypeVar("T", bound=BaseModel)
+
+
+@cache
+def _provider_errors() -> tuple[type[BaseException], ...]:
+    """Exception classes that mean "the provider failed", imported lazily.
+
+    The Fake and replay paths must work with no SDK installed, so nothing is imported
+    at module scope. Transport errors surface under whichever HTTP client the installed
+    SDK is built on -- ``httpx`` historically, ``httpx2`` in current releases -- so both
+    are tried and whatever is present contributes. Missing modules simply drop out; an
+    empty tuple is a valid ``except`` target and catches nothing.
+    """
+    found: list[type[BaseException]] = []
+    sources = (("anthropic", "APIError"), ("httpx", "HTTPError"), ("httpx2", "HTTPError"))
+    for module, attr in sources:
+        try:
+            exc = getattr(importlib.import_module(module), attr)
+        except (ImportError, AttributeError):
+            continue
+        if isinstance(exc, type) and issubclass(exc, BaseException):
+            found.append(exc)
+    return tuple(found)
 
 
 class AnthropicClient:
@@ -21,13 +45,18 @@ class AnthropicClient:
         self._client: Any = client
 
     def structured(self, *, system: str, user: str, schema: type[T]) -> T:
-        response = self._client.messages.parse(
-            model=self.model_id,
-            max_tokens=16000,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            output_format=schema,
-        )
+        try:
+            response = self._client.messages.parse(
+                model=self.model_id,
+                max_tokens=16000,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+                output_format=schema,
+            )
+        except _provider_errors() as e:
+            # Callers up the loop handle one failure type from every client. A bare
+            # SDK/transport error leaking out would make each of them import the SDKs.
+            raise LLMError(f"anthropic: {type(e).__name__}: {e}") from e
         if getattr(response, "stop_reason", None) == "refusal":
             raise LLMError("model refused the request")
         parsed = response.parsed_output

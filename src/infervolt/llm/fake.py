@@ -78,13 +78,31 @@ class FakeLLMClient:
         )
 
     def _plan(self, ctx: dict[str, Any]) -> SearchPlanOut:
+        """Turn the diagnosed bottleneck into prior candidates the search should try first.
+
+        Filtering is about *relevance*, not feasibility: a prior survives here as long as
+        it names knobs this engine offers and would actually change something. Whether the
+        resulting config is legal on this hardware (fp8 quantization needs compute
+        capability >= 8.9, say) is the planner's call -- it holds the RunContext and drops
+        invalid priors before they reach the search. Duplicating that check here would put
+        hardware rules in a client that only ever sees a JSON blob.
+        """
         primary = ctx["diagnosis"]["primary"]
         names = {k["name"] for k in ctx["knob_space"]}
         current = ctx.get("current", {})
-        priors = []
+        priors: list[PriorOut] = []
+        seen: set[tuple[tuple[str, KnobValue], ...]] = set()
         for knobs, hyp in PRIORS.get(primary, []):
-            kept = {k: v for k, v in knobs.items() if k in names and current.get(k) != v}
-            if kept:
+            # A knob the engine does not offer is simply unknown here, and dropping it
+            # leaves the rest of the hypothesis intact. A knob already at the proposed
+            # value is different: the hypothesis is about *changing* it, so with that
+            # change gone the remaining knobs no longer test what the sentence claims.
+            if any(k in names and current.get(k) == v for k, v in knobs.items()):
+                continue
+            kept = {k: v for k, v in knobs.items() if k in names}
+            key = tuple(sorted(kept.items(), key=lambda kv: kv[0]))
+            if kept and key not in seen:
+                seen.add(key)
                 priors.append(PriorOut(knobs=kept, hypothesis=hyp))
         return SearchPlanOut(
             subspaces=list(ctx["diagnosis"]["subspaces"]),
