@@ -52,6 +52,7 @@ packages = ["src/infervolt"]
 
 [tool.ruff]
 line-length = 100
+exclude = ["docs"]
 target-version = "py311"
 src = ["src", "tests"]
 
