@@ -59,7 +59,11 @@ class HardwareProfile(BaseModel):
     peak_tflops: float
     compute_capability: float
     interconnect: Literal["single", "nvlink", "pcie"] = "single"
-    usd_per_hour: float = 0.0
+    usd_per_hour: float = Field(
+        default=0.0,
+        description="Rental price of a single GPU, in USD per hour; multiply by 'count' "
+        "for the price of the whole node.",
+    )
 
 
 class ModelInfo(BaseModel):
@@ -195,7 +199,9 @@ class ClientHealth(BaseModel):
 
 class LoadResult(BaseModel):
     concurrency: int
-    duration_s: float
+    duration_s: float = Field(
+        gt=0, description="Wall-clock seconds the load phase ran; every rate divides by it."
+    )
     requests: list[RequestRecord]
     health: ClientHealth = Field(default_factory=ClientHealth)
 
@@ -215,7 +221,10 @@ class Metrics(BaseModel):
     goodput_frac: float
     error_rate: float
     tokens_per_s_per_gpu: float
-    usd_per_m_tokens: float
+    usd_per_m_tokens: float = Field(
+        description="USD per million *output* tokens (input tokens are not counted); "
+        "infinite when the run produced no output tokens."
+    )
 
 
 class Evidence(BaseModel):
