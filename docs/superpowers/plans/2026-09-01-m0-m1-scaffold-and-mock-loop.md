@@ -4895,82 +4895,168 @@ Expected: FAIL with `ModuleNotFoundError`.
 
 `src/infervolt/search/space.py`:
 ```python
-"""Knob-space utilities: OOM-tightened bounds, clamping, novelty."""
+"""Knob-space utilities: OOM-tightened bounds, clamping, novelty.
+
+The sampler proposes points; these helpers decide which of them are worth spending a
+trial on. :class:`Bounds` is the search's crash memory -- an OOM lowers the ceiling of
+the knob that caused it, so the same too-large config cannot come back under a different
+random draw -- and :func:`is_novel` keeps the search from re-measuring a config it has
+already paid for.
+"""
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 from infervolt.core.types import Knob, KnobSpace, KnobValue
 
 NOVELTY_EPS = 0.05
+"""Two configs closer than this in normalised max-norm distance are the same config.
+
+Normalisation puts every knob on [0, 1], so 0.05 is "within 5% of the range on *every*
+knob": far enough apart to be worth a trial, close enough that a 0.005 nudge to
+``gpu_memory_utilization`` is not.
+"""
 
 
 def _numeric_choices(k: Knob) -> list[float] | None:
-    if k.kind == "cat" and k.choices and all(isinstance(c, int | float) and not isinstance(c, bool) for c in k.choices):
-        return sorted(float(c) for c in k.choices)
-    return None
+    """The choices of a numeric categorical knob, ascending, or ``None`` if it is not one.
+
+    Bools are excluded deliberately: ``True`` is numerically 1, but ordering a knob whose
+    choices are ``[True, False]`` by value would invent a magnitude it does not have.
+    """
+    if k.kind != "cat" or not k.choices:
+        return None
+    if not all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in k.choices):
+        return None
+    return sorted(float(c) for c in k.choices)
+
+
+BACKOFF: dict[str, Callable[[float], float]] = {
+    "gpu_memory_utilization": lambda v: round(v - 0.05, 2),
+    "max_model_len": lambda v: v / 2,
+    "max_num_seqs": lambda v: v - 1,
+}
+"""How far each memory knob retreats from a value that just ran out of memory.
+
+Deliberately coarse -- one utilisation notch, half the context, one fewer sequence --
+because the goal is to leave the region that failed, not to bisect it. Knobs absent from
+this table are not memory knobs and are never tightened.
+"""
 
 
 class Bounds:
-    """Upper bounds per knob, lowered whenever a config OOMs (SLO-Guard style)."""
+    """Upper bounds per knob, lowered whenever a config runs out of memory.
+
+    Only knobs with a numeric ceiling appear in ``high``; a categorical knob such as
+    ``kv_cache_dtype`` has no direction to back off in and is left out entirely.
+    """
 
     def __init__(self, space: KnobSpace) -> None:
         self.high: dict[str, float] = {}
+        self.low: dict[str, float] = {}
         for k in space.knobs:
-            if k.kind in ("int", "float") and k.high is not None:
-                self.high[k.name] = float(k.high)
+            if k.kind in ("int", "float") and k.low is not None and k.high is not None:
+                self.low[k.name], self.high[k.name] = float(k.low), float(k.high)
             elif (nc := _numeric_choices(k)) is not None:
-                self.high[k.name] = nc[-1]
+                self.low[k.name], self.high[k.name] = nc[0], nc[-1]
 
     def tighten_on_oom(self, knobs: dict[str, KnobValue]) -> None:
+        """Back off the memory knobs of a config that just OOMed.
+
+        ``min`` keeps each ceiling monotonically falling: an OOM at a value already above
+        the current ceiling teaches nothing new.
+
+        A back-off that would fall below the knob's own floor is *not* applied. An OOM
+        blames every memory knob in the config at once, only one of which is usually
+        guilty, so "this knob has no valid value left" is the wrong conclusion to draw
+        from it -- and a ceiling under the floor would make every later config invalid
+        rather than merely conservative, ending the search instead of steering it.
+        """
         for name, value in knobs.items():
-            if name not in self.high or isinstance(value, bool | str):
+            back_off = BACKOFF.get(name)
+            if back_off is None or name not in self.high or isinstance(value, (bool, str)):
                 continue
-            v = float(value)
-            if name == "gpu_memory_utilization":
-                self.high[name] = min(self.high[name], round(v - 0.05, 2))
-            elif name == "max_model_len":
-                self.high[name] = min(self.high[name], v / 2)
-            elif name == "max_num_seqs":
-                self.high[name] = min(self.high[name], v - 1)
+            proposed = back_off(float(value))
+            if proposed >= self.low[name]:
+                self.high[name] = min(self.high[name], proposed)
 
 
 def clamp(knobs: dict[str, KnobValue], space: KnobSpace, bounds: Bounds) -> dict[str, KnobValue]:
+    """Pull every knob down to its current ceiling, preserving each knob's type.
+
+    Categorical knobs snap to the largest *offered* choice at or below the ceiling, so a
+    clamped ``max_model_len`` is still a value the engine accepts. Knobs the bounds do
+    not track, and knobs absent from ``knobs``, pass through untouched.
+    """
     out: dict[str, KnobValue] = dict(knobs)
     for k in space.knobs:
         if k.name not in out or k.name not in bounds.high:
             continue
         v = out[k.name]
-        if isinstance(v, bool | str):
+        if isinstance(v, (bool, str)):
             continue
         hi = bounds.high[k.name]
         if k.kind == "int":
-            out[k.name] = int(min(int(v), int(hi)))
+            out[k.name] = min(int(v), int(hi))
         elif k.kind == "float":
-            out[k.name] = float(min(float(v), hi))
+            out[k.name] = min(float(v), hi)
         else:
             nc = _numeric_choices(k) or []
-            allowed = [c for c in nc if c <= hi] or nc[:1]
-            out[k.name] = int(min(float(v), allowed[-1])) if all(float(c).is_integer() for c in nc) else min(float(v), allowed[-1])
+            allowed = [c for c in nc if c <= hi]
+            if not allowed:
+                # Nothing the engine offers is under the ceiling, so there is no valid
+                # value to snap to; leave the knob and let validation say so.
+                continue
+            capped = min(float(v), allowed[-1])
+            out[k.name] = int(capped) if all(c.is_integer() for c in nc) else capped
     return out
 
 
 def _normalize(k: Knob, v: KnobValue) -> float:
+    """Map one knob value onto [0, 1] so distances are comparable across knobs.
+
+    Log knobs are normalised in log space: ``max_num_seqs`` 8 and 16 are one octave of
+    seven apart, not the 0.8% of the linear range they look like.
+    """
     if k.kind == "bool":
         return 1.0 if v else 0.0
     if k.kind == "cat":
+        # An off-space value has no position; 0.0 keeps it comparable without pretending
+        # it sits anywhere in particular.
         return k.choices.index(v) / max(len(k.choices) - 1, 1) if v in k.choices else 0.0
-    lo, hi = float(k.low or 0), float(k.high or 1)
-    x = float(v)
+    assert k.low is not None and k.high is not None  # guaranteed by the Knob validator
+    lo, hi, x = float(k.low), float(k.high), float(v)
     if k.log and lo > 0 and hi > lo:
         return (math.log(x) - math.log(lo)) / (math.log(hi) - math.log(lo))
     return (x - lo) / (hi - lo) if hi > lo else 0.0
 
 
-def is_novel(knobs: dict[str, KnobValue], seen: list[dict[str, KnobValue]], space: KnobSpace, eps: float = NOVELTY_EPS) -> bool:
+def is_novel(
+    knobs: dict[str, KnobValue],
+    seen: list[dict[str, KnobValue]],
+    space: KnobSpace,
+    eps: float = NOVELTY_EPS,
+) -> bool:
+    """True when ``knobs`` differs from every config in ``seen`` on at least one knob.
+
+    The max-norm is the right metric here rather than a Euclidean one: a single knob
+    moved a long way is a genuinely different config, however many others stayed put.
+    Knobs missing from either side are read as their default, which is what the engine
+    would have used.
+    """
     for other in seen:
-        dist = max((abs(_normalize(k, knobs.get(k.name, k.default)) - _normalize(k, other.get(k.name, k.default))) for k in space.knobs), default=1.0)
+        dist = max(
+            (
+                abs(
+                    _normalize(k, knobs.get(k.name, k.default))
+                    - _normalize(k, other.get(k.name, k.default))
+                )
+                for k in space.knobs
+            ),
+            default=1.0,
+        )
         if dist < eps:
             return False
     return True
@@ -4978,45 +5064,115 @@ def is_novel(knobs: dict[str, KnobValue], seen: list[dict[str, KnobValue]], spac
 
 `src/infervolt/search/optuna_search.py`:
 ```python
-"""Optuna TPE search inside the planned sub-space with priors, novelty filter, crash-aware bounds,
-and a cheap stage-1 evaluation that prunes below-median candidates before the full sweep."""
+"""Optuna TPE search inside the planned sub-space.
+
+Three things separate this from a plain ``study.optimize`` call. Priors from the planner
+are enqueued so the LLM's hypotheses are tested first and attributed when they land. A
+novelty filter refuses to spend a trial on a config the run has already measured. And a
+crash is a *result*: an OOM tightens :class:`~infervolt.search.space.Bounds` so the
+sampler stops proposing configs that cannot launch, rather than being retried.
+
+Every candidate is measured twice: a cheap stage 1 at the baseline's best load point,
+then -- only if it beats the median of the stage-1 scores so far -- a full sweep at
+stage 2. That is ASHA's idea with a single rung, and it is what keeps a search of a
+dozen candidates inside a trial budget meant for half that many.
+"""
 
 from __future__ import annotations
 
 import statistics
+import time
 import uuid
+import warnings
+from collections.abc import Callable
+from typing import cast
 
 import optuna
 
-from infervolt.core.types import Budget, Candidate, Knob, KnobSpace, KnobValue, RunContext, SearchPlan, Trial
+from infervolt.core.types import (
+    Budget,
+    Candidate,
+    Knob,
+    KnobSpace,
+    KnobValue,
+    RunContext,
+    SearchPlan,
+    Trial,
+)
 from infervolt.engines.base import EngineAdapter
 from infervolt.runner.trial import run_candidate
 from infervolt.search.space import Bounds, clamp, is_novel
 from infervolt.store.ledger import Ledger
 
 WORST = -1.0
+"""Objective reported for a trial that measured nothing.
+
+Below every real goodput (which is non-negative), so TPE learns to avoid the region
+without the sampler ever having to be told *why* the trial failed.
+"""
+
 MAX_SKIPS = 20
+"""Consecutive-ish novelty rejections tolerated before giving up on the sub-space.
+
+A sampler that keeps proposing points the run has already measured has exhausted the
+region it believes in; more asks would only spend wall-clock.
+"""
+
 STAGE1_REQUESTS = 8
 STAGE2_REQUESTS = 16
 MIN_STAGE1_BEFORE_PRUNE = 3
+"""Stage-1 scores needed before a median is worth pruning against."""
+
+# ``multivariate=True`` is still flagged experimental upstream, and the sampler is chatty
+# about every enqueued trial. Neither is news to a user running a search.
+warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
 
 
 def _suggest(trial: optuna.Trial, k: Knob) -> KnobValue:
+    """Ask Optuna for one value of ``k``, in the knob's own type."""
     if k.kind == "int":
-        assert k.low is not None and k.high is not None  # guaranteed by Knob validator
+        assert k.low is not None and k.high is not None  # guaranteed by the Knob validator
         return trial.suggest_int(k.name, int(k.low), int(k.high), log=k.log)
     if k.kind == "float":
-        assert k.low is not None and k.high is not None  # guaranteed by Knob validator
-        return trial.suggest_float(k.name, float(k.low), float(k.high), step=k.step)
+        assert k.low is not None and k.high is not None  # guaranteed by the Knob validator
+        if k.step is None:
+            return trial.suggest_float(k.name, float(k.low), float(k.high), log=k.log)
+        # Optuna walks a stepped grid as low + n*step in binary floating point, so the
+        # fifth notch of a 0.05 step comes back as 0.8999999999999999. Numerically that
+        # is 0.9, but it is not 0.9 in a config key or on an engine's command line, so
+        # trim the dust before it reaches either.
+        return float(
+            f"{trial.suggest_float(k.name, float(k.low), float(k.high), step=float(k.step)):.12g}"
+        )
     if k.kind == "bool":
         return bool(trial.suggest_categorical(k.name, [True, False]))
-    return trial.suggest_categorical(k.name, k.choices)  # type: ignore[return-value]
+    # Optuna's categorical choices are None | bool | int | float | str, which is exactly
+    # KnobValue plus None -- so the value coming back is a KnobValue, but the stub types
+    # it as the wider union.
+    return cast(KnobValue, trial.suggest_categorical(k.name, k.choices))
 
 
 def run_search(
-    adapter: EngineAdapter, ctx: RunContext, space: KnobSpace, plan: SearchPlan, baseline: Trial,
-    ledger: Ledger, budget: Budget, seed: int, on_trial: object | None = None,
+    adapter: EngineAdapter,
+    ctx: RunContext,
+    space: KnobSpace,
+    plan: SearchPlan,
+    baseline: Trial,
+    ledger: Ledger,
+    budget: Budget,
+    seed: int,
+    deadline: float | None = None,
+    on_trial: Callable[[Trial], None] | None = None,
 ) -> list[Trial]:
+    """Search ``plan.subspaces`` for a config that beats ``baseline``.
+
+    Returns every trial run, in order, each already saved to the ledger. Nothing here
+    raises on a bad candidate: a crash, an OOM or a rejected config all come back as
+    trials with a terminal status, which is what the caller reports on.
+
+    ``deadline`` is an absolute ``time.time()`` value; the loop stops before starting a
+    trial it would cross.
+    """
     assert baseline.result is not None
     sub = space.subspace(plan.subspaces)
     if not sub.knobs:
@@ -5024,22 +5180,33 @@ def run_search(
     base_cfg = baseline.candidate.config.with_knobs(**plan.fixed)
     bounds = Bounds(sub)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=seed, multivariate=True, n_startup_trials=3))
-    prior_keys: dict[str, str] = {}
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed, multivariate=True, n_startup_trials=3),
+    )
+    # Priors go in ahead of anything TPE would pick, and are recognised on the way back
+    # out by config key so the trial can carry the planner's hypothesis.
+    prior_hypotheses: dict[str, str] = {}
     for p in plan.priors:
         params = {k.name: p.config.knobs[k.name] for k in sub.knobs if k.name in p.config.knobs}
         if params:
             study.enqueue_trial(params, skip_if_exists=True)
-            prior_keys[base_cfg.with_knobs(**params).key()] = p.hypothesis
-    seen: list[dict[str, KnobValue]] = [baseline.candidate.config.knobs] + [t.candidate.config.knobs for t in ledger.trials(ctx.run_id)]
+            prior_hypotheses[base_cfg.with_knobs(**params).key()] = p.hypothesis
+    prior_trials = ledger.trials(ctx.run_id)
+    seen: list[dict[str, KnobValue]] = [baseline.candidate.config.knobs]
+    seen += [t.candidate.config.knobs for t in prior_trials]
     trials: list[Trial] = []
     stage1_scores: list[float] = []
     max_trials = min(plan.max_trials, budget.max_trials)
     skips = 0
-    index = len(ledger.trials(ctx.run_id))
+    index = len(prior_trials)
     stage1_c = [baseline.result.best_load_point]
     stage2_c = ctx.workload.load.concurrency
-    while len(trials) < max_trials and skips < MAX_SKIPS:
+    while (
+        len(trials) < max_trials
+        and skips < MAX_SKIPS
+        and (deadline is None or time.time() < deadline)
+    ):
         ot = study.ask()
         params = clamp({k.name: _suggest(ot, k) for k in sub.knobs}, sub, bounds)
         cfg = base_cfg.with_knobs(**params)
@@ -5048,38 +5215,73 @@ def run_search(
             skips += 1
             continue
         seen.append(cfg.knobs)
-        hyp = prior_keys.get(cfg.key(), "")
-        cand = Candidate(id=f"c{uuid.uuid4().hex[:6]}", config=cfg, origin="llm_prior" if hyp else "tpe", hypothesis=hyp, parent_id=baseline.candidate.id)
+        hypothesis = prior_hypotheses.get(cfg.key(), "")
         index += 1
-        trial = Trial(id=f"t{index}", run_id=ctx.run_id, index=index, candidate=cand, stage=1)
+        trial = Trial(
+            id=f"t{index}",
+            run_id=ctx.run_id,
+            index=index,
+            candidate=Candidate(
+                id=f"c{uuid.uuid4().hex[:6]}",
+                config=cfg,
+                origin="llm_prior" if hypothesis else "tpe",
+                hypothesis=hypothesis,
+                parent_id=baseline.candidate.id,
+            ),
+            stage=1,
+        )
         trial = run_candidate(adapter, trial, ctx, stage1_c, STAGE1_REQUESTS)
-        if trial.status != "ok" or trial.result is None:
-            if trial.crash_kind == "oom":
-                bounds.tighten_on_oom(cfg.knobs)
+        s1 = _score(trial)
+        if s1 is None:
+            # Crashed, was rejected, or served nothing measurable. Either way it produced
+            # no score to rank against, so it is not part of the pruning median.
+            _tighten_if_oom(bounds, trial)
             study.tell(ot, WORST)
             _record(ledger, trial, trials, on_trial)
             continue
-        s1 = trial.result.objective
         if len(stage1_scores) >= MIN_STAGE1_BEFORE_PRUNE and s1 < statistics.median(stage1_scores):
             stage1_scores.append(s1)
             trial.status = "pruned"
+            # The stage-1 number is real, just cheap: tell it to TPE rather than WORST,
+            # which would teach the sampler that a merely-below-median region is fatal.
             study.tell(ot, s1)
             _record(ledger, trial, trials, on_trial)
             continue
         stage1_scores.append(s1)
         trial.stage = 2
         trial = run_candidate(adapter, trial, ctx, stage2_c, STAGE2_REQUESTS)
-        study.tell(ot, trial.result.objective if trial.status == "ok" and trial.result else WORST)
-        if trial.crash_kind == "oom":
-            bounds.tighten_on_oom(cfg.knobs)
+        s2 = _score(trial)
+        _tighten_if_oom(bounds, trial)
+        study.tell(ot, WORST if s2 is None else s2)
         _record(ledger, trial, trials, on_trial)
     return trials
 
 
-def _record(ledger: Ledger, trial: Trial, trials: list[Trial], on_trial: object | None) -> None:
+def _score(trial: Trial) -> float | None:
+    """The trial's objective, or ``None`` when it measured nothing usable.
+
+    ``feasible`` is false when every observation in the sweep was invalid, which
+    ``run_candidate`` still reports as status ``"ok"`` with an objective of 0.0. To the
+    search that is indistinguishable from a crash and must not be ranked as a poor but
+    working config.
+    """
+    if trial.status != "ok" or trial.result is None or not trial.result.feasible:
+        return None
+    return trial.result.objective
+
+
+def _tighten_if_oom(bounds: Bounds, trial: Trial) -> None:
+    """Lower the ceilings if this trial died out of memory."""
+    if trial.crash_kind == "oom":
+        bounds.tighten_on_oom(trial.candidate.config.knobs)
+
+
+def _record(
+    ledger: Ledger, trial: Trial, trials: list[Trial], on_trial: Callable[[Trial], None] | None
+) -> None:
     ledger.save_trial(trial)
     trials.append(trial)
-    if callable(on_trial):
+    if on_trial is not None:
         on_trial(trial)
 ```
 
