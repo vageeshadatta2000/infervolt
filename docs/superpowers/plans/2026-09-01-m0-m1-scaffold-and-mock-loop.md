@@ -404,7 +404,7 @@ from __future__ import annotations
 import json
 from typing import Literal
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 KnobValue = int | float | str | bool
 
@@ -605,6 +605,10 @@ class LoadResult(BaseModel):
 
 
 class Metrics(BaseModel):
+    # ``usd_per_m_tokens`` is infinite for a run with no output tokens; the default JSON
+    # serialiser turns inf into null, which fails to validate back, so encode it as a string.
+    model_config = ConfigDict(ser_json_inf_nan="strings")
+
     ttft_p50_ms: float
     ttft_p90_ms: float
     ttft_p99_ms: float
@@ -1002,9 +1006,11 @@ def prefill_floor_s(hw: HardwareProfile, m: ModelInfo, tokens: int) -> float:
 
     * ``linear`` -- ``2 * active_params * tokens`` FLOPs: one multiply-add per active
       parameter per token through the dense/expert projections.
-    * ``attn`` -- ``4 * tokens**2 * hidden * num_layers`` FLOPs: the quadratic
+    * ``attn`` -- ``2 * tokens**2 * hidden * num_layers`` FLOPs: the quadratic
       score-and-weighted-sum pair (two matmuls, 2 FLOPs each) that the linear term
-      ignores. Negligible at short context, dominant at long context.
+      ignores, halved because inference attention is causal -- only the lower triangle
+      of the tokens x tokens score matrix is computed, so the full ``4 * L**2`` figure
+      overstates the work by 2x. Negligible at short context, dominant at long context.
     * the weight stream -- ``weight_bytes / hbm_bw``: even a one-token prefill must read
       every weight out of HBM once.
 
@@ -1014,7 +1020,7 @@ def prefill_floor_s(hw: HardwareProfile, m: ModelInfo, tokens: int) -> float:
     if tokens <= 0:
         raise ValueError(f"tokens must be positive, got {tokens!r}")
     linear = 2.0 * active_params(m) * tokens
-    attn = 4.0 * tokens**2 * m.hidden * m.num_layers
+    attn = 2.0 * tokens**2 * m.hidden * m.num_layers
     t_compute = (linear + attn) / (hw.peak_tflops * 1e12)
     t_mem = weight_bytes(m) / (hw.hbm_bw_gbs * 1e9)
     return max(t_compute, t_mem)
@@ -1496,10 +1502,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
 
 from pydantic import BaseModel
 
@@ -1539,51 +1547,71 @@ class Ledger:
         self.runs_dir = runs_dir
         db_path.parent.mkdir(parents=True, exist_ok=True)
         runs_dir.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
 
     # ---- runs
     def create_run(self, spec: OptimizeSpec) -> str:
         run_id = spec.run_id or new_run_id()
         self.run_dir(run_id).mkdir(parents=True, exist_ok=True)
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
-                "INSERT OR REPLACE INTO runs(id, created, spec, state) VALUES (?,?,?,?)",
+                "INSERT OR IGNORE INTO runs(id, created, spec, state) VALUES (?,?,?,?)",
                 (run_id, time.time(), spec.model_dump_json(), "prepare"),
             )
         return run_id
 
     def get_run(self, run_id: str) -> RunRow:
-        row = self._conn.execute(
-            "SELECT id, created, spec, state, best_trial_id, recipe_path, diagnosis FROM runs WHERE id=?",
-            (run_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, created, spec, state, best_trial_id, recipe_path, diagnosis "
+                "FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
         if row is None:
             raise KeyError(run_id)
         return RunRow(
-            id=row[0], created=row[1], spec=OptimizeSpec.model_validate_json(row[2]),
-            state=row[3], best_trial_id=row[4], recipe_path=row[5], diagnosis_json=row[6],
+            id=row[0],
+            created=row[1],
+            spec=OptimizeSpec.model_validate_json(row[2]),
+            state=row[3],
+            best_trial_id=row[4],
+            recipe_path=row[5],
+            diagnosis_json=row[6],
         )
 
+    def _update_run(self, run_id: str, sql: str, value: object) -> None:
+        """Apply a single-column update, raising ``KeyError`` when the run does not exist."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(sql, (value, run_id))
+        if cursor.rowcount == 0:
+            raise KeyError(run_id)
+
     def set_state(self, run_id: str, state: RunState) -> None:
-        with self._conn:
-            self._conn.execute("UPDATE runs SET state=? WHERE id=?", (state, run_id))
+        self._update_run(run_id, "UPDATE runs SET state=? WHERE id=?", state)
 
     def set_best(self, run_id: str, trial_id: str | None) -> None:
-        with self._conn:
-            self._conn.execute("UPDATE runs SET best_trial_id=? WHERE id=?", (trial_id, run_id))
+        self._update_run(run_id, "UPDATE runs SET best_trial_id=? WHERE id=?", trial_id)
 
     def set_recipe(self, run_id: str, path: str) -> None:
-        with self._conn:
-            self._conn.execute("UPDATE runs SET recipe_path=? WHERE id=?", (path, run_id))
+        self._update_run(run_id, "UPDATE runs SET recipe_path=? WHERE id=?", path)
 
     def set_diagnosis(self, run_id: str, diagnosis_json: str) -> None:
-        with self._conn:
-            self._conn.execute("UPDATE runs SET diagnosis=? WHERE id=?", (diagnosis_json, run_id))
+        self._update_run(run_id, "UPDATE runs SET diagnosis=? WHERE id=?", diagnosis_json)
 
     # ---- trials
     def save_trial(self, trial: Trial) -> None:
-        with self._conn:
+        """Upsert the trial row and append it to the run's JSONL event log.
+
+        The JSONL file is an append-only event log, not a table: an upsert of an
+        already-saved trial appends a second line for the same trial id. Readers must
+        therefore take the *last* event per trial id; the SQLite row is the current value.
+        """
+        self.run_dir(trial.run_id).mkdir(parents=True, exist_ok=True)
+        with self._lock, self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO trials(id, run_id, idx, data) VALUES (?,?,?,?)",
                 (trial.id, trial.run_id, trial.index, trial.model_dump_json()),
@@ -1592,9 +1620,10 @@ class Ledger:
             f.write(json.dumps({"event": "trial", "trial": trial.model_dump(mode="json")}) + "\n")
 
     def trials(self, run_id: str) -> list[Trial]:
-        rows = self._conn.execute(
-            "SELECT data FROM trials WHERE run_id=? ORDER BY idx", (run_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT data FROM trials WHERE run_id=? ORDER BY idx, id", (run_id,)
+            ).fetchall()
         return [Trial.model_validate_json(r[0]) for r in rows]
 
     # ---- artifacts
@@ -1605,7 +1634,19 @@ class Ledger:
         return self.run_dir(run_id) / "trials.jsonl"
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
+
+    def __enter__(self) -> Ledger:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
 ```
 
 - [ ] **Step 4: Run tests and lint**
@@ -1847,12 +1888,25 @@ from jinja2 import Environment, PackageLoader, select_autoescape
 
 from infervolt.recipes.schema import Recipe
 
+
+def yamlish(value: object) -> object:
+    """Render booleans the way YAML and engine CLIs spell them; leave everything else alone."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return value
+
+
 _env = Environment(
+    # Autoescape is intentionally off: these templates render Markdown, not HTML, and
+    # HTML-escaping would mangle model ids, CLI flags and quoted knob values.
     loader=PackageLoader("infervolt.recipes", "templates"),
     autoescape=select_autoescape(default=False),
     trim_blocks=True,
     lstrip_blocks=True,
 )
+_env.filters["yamlish"] = yamlish
 
 
 def write_recipe(recipe: Recipe, out_dir: Path) -> Path:
@@ -1908,7 +1962,7 @@ Verified with {{ r.result.repeats }} interleaved repeats.
 | Knob | Baseline | Tuned |
 |---|---|---|
 {% for k, v in r.serve.args.items() %}
-| {{ k }} | {{ r.baseline.serve_args.get(k, '') }} | {{ v }} |
+| {{ k }} | {{ r.baseline.serve_args.get(k, '') | yamlish }} | {{ v | yamlish }} |
 {% endfor %}
 
 ## Search
@@ -1919,10 +1973,32 @@ Verified with {{ r.result.repeats }} interleaved repeats.
 ## Workload and SLO
 
 `{{ r.workload.name }}`: ISL p50 {{ r.workload.isl.p50 }}, OSL p50 {{ r.workload.osl.p50 }}, prefix share {{ r.workload.prefix_share }}.
-SLO: ttft {{ r.slo.ttft_ms }} ms, itl {{ r.slo.itl_ms }} ms, e2e {{ r.slo.e2e_ms }} ms at p{{ (r.slo.percentile * 100) | int }}.
+{% set parts = [] %}
+{% if r.slo.ttft_ms is not none %}{% set _ = parts.append('ttft %s ms' % r.slo.ttft_ms) %}{% endif %}
+{% if r.slo.itl_ms is not none %}{% set _ = parts.append('itl %s ms' % r.slo.itl_ms) %}{% endif %}
+{% if r.slo.e2e_ms is not none %}{% set _ = parts.append('e2e %s ms' % r.slo.e2e_ms) %}{% endif %}
+{% if parts %}
+SLO: {{ parts | join(', ') }} at p{{ (r.slo.percentile * 100) | int }}, goodput target {{ r.slo.goodput_target }}.
+{% else %}
+SLO: none (throughput only), goodput target {{ r.slo.goodput_target }}.
+{% endif %}
 
 ## Reproduce
 
+```bash
+{{ r.serve.command }}
+```
+
+## Next steps
+
+{% for s in r.infervolt.next_steps %}
+- {{ s }}
+{% endfor %}
+
+## Caveats
+
+- Measurements come from a synthetic or real load generator as recorded in `artifacts`; GPUs are not bit-reproducible, expect a few percent variance.
+- Provenance: llm `{{ r.infervolt.provenance.llm }}`, prompts `{{ r.infervolt.provenance.prompts_sha }}`.
 ```bash
 {{ r.serve.command }}
 ```
@@ -2000,7 +2076,7 @@ app.add_typer(recipe_app, name="recipe")
 
 
 @recipe_app.command("validate")
-def recipe_validate(path: Path) -> None:
+def recipe_validate(path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)]) -> None:
     """Validate a recipe.yaml against the infervolt schema."""
     try:
         Recipe.model_validate(yaml.safe_load(path.read_text()))
@@ -2011,11 +2087,7 @@ def recipe_validate(path: Path) -> None:
 ```
 Put the imports at the top of the file with the others (the `noqa` markers above only exist so the snippet reads in isolation; remove them).
 
-In `pyproject.toml`, under `[tool.hatch.build.targets.wheel]` add:
-```toml
-[tool.hatch.build]
-include = ["src/infervolt/**/*.py", "src/infervolt/**/*.j2", "src/infervolt/py.typed"]
-```
+In `pyproject.toml`, under `[tool.hatch.build.targets.wheel]` add `artifacts = ["*.j2"]` (wheel-only; a global `[tool.hatch.build] include` would strip tests/ and examples/ from the sdist).
 
 - [ ] **Step 5: Run tests and lint**
 
@@ -4997,7 +5069,7 @@ def report(run_id: str, home: Path | None = typer.Option(None)) -> None:
 
 
 @recipe_app.command("validate")
-def recipe_validate(path: Path) -> None:
+def recipe_validate(path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)]) -> None:
     """Validate a recipe.yaml against the infervolt schema."""
     try:
         Recipe.model_validate(yaml.safe_load(path.read_text()))
