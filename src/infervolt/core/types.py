@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 KnobValue = int | float | str | bool
 
@@ -35,10 +35,19 @@ class Workload(BaseModel):
 
 
 class SLO(BaseModel):
+    """Latency targets plus how strictly they must hold.
+
+    ``percentile`` is the per-request latency percentile the ``*_ms`` targets are
+    measured at (e.g. 0.9 means the p90 of each latency must be under its target).
+    ``goodput_target`` is a different axis: the fraction of requests that must meet
+    the SLO for the run as a whole to count as "SLO met".
+    """
+
     ttft_ms: float | None = None
     itl_ms: float | None = None
     e2e_ms: float | None = None
     percentile: float = 0.9
+    goodput_target: float = 0.9
 
 
 class HardwareProfile(BaseModel):
@@ -75,11 +84,46 @@ class Knob(BaseModel):
     kind: Literal["int", "float", "cat", "bool"]
     groups: list[str]
     default: KnobValue
-    low: float | None = None
-    high: float | None = None
-    step: float | None = None
+    low: int | float | None = None
+    high: int | float | None = None
+    step: int | float | None = None
     log: bool = False
     choices: list[KnobValue] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_kind_consistency(self) -> Knob:
+        if self.kind == "cat":
+            if not self.choices:
+                raise ValueError(f"knob {self.name!r}: kind 'cat' requires a non-empty 'choices'")
+            if self.default not in self.choices:
+                raise ValueError(
+                    f"knob {self.name!r}: default {self.default!r} is not in choices "
+                    f"{self.choices!r}"
+                )
+        elif self.kind in ("int", "float"):
+            if self.low is None or self.high is None:
+                raise ValueError(
+                    f"knob {self.name!r}: kind {self.kind!r} requires both 'low' and 'high'"
+                )
+            if self.low > self.high:
+                raise ValueError(
+                    f"knob {self.name!r}: low {self.low!r} must be <= high {self.high!r}"
+                )
+            if isinstance(self.default, (str, bool)):
+                raise ValueError(
+                    f"knob {self.name!r}: kind {self.kind!r} requires a numeric default, "
+                    f"got {self.default!r}"
+                )
+            if not self.low <= self.default <= self.high:
+                raise ValueError(
+                    f"knob {self.name!r}: default {self.default!r} is outside "
+                    f"[{self.low!r}, {self.high!r}]"
+                )
+        elif self.kind == "bool" and not isinstance(self.default, bool):
+            raise ValueError(
+                f"knob {self.name!r}: kind 'bool' requires a bool default, got {self.default!r}"
+            )
+        return self
 
 
 class KnobSpace(BaseModel):
@@ -125,11 +169,19 @@ class EngineConfig(BaseModel):
 
 
 class RequestRecord(BaseModel):
+    """One request's timing.
+
+    Invariant: ``len(itl_s) == output_tokens`` -- one inter-token latency per generated
+    token. ``ttft_s`` covers the first token (time from request start to its arrival),
+    so ``e2e_s`` is ``ttft_s`` plus the whole of ``itl_s``.
+    """
+
     ttft_s: float
     itl_s: list[float]
     output_tokens: int
     ok: bool = True
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def e2e_s(self) -> float:
         return self.ttft_s + sum(self.itl_s)
@@ -196,7 +248,7 @@ Bottleneck = Literal[
     "client_artifact",
 ]
 
-BOTTLENECK_PRIORITY: dict[str, int] = {
+BOTTLENECK_PRIORITY: dict[Bottleneck, int] = {
     "client_artifact": 0,
     "kv_capacity": 1,
     "prefill_compute": 2,
