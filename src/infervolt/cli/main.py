@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
 import typer
 import yaml
@@ -34,11 +35,13 @@ app.add_typer(recipe_app, name="recipe")
 
 
 @recipe_app.command("validate")
-def recipe_validate(path: Path) -> None:
+def recipe_validate(
+    path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+) -> None:
     """Validate a recipe.yaml against the infervolt schema."""
     try:
         Recipe.model_validate(yaml.safe_load(path.read_text()))
-    except (ValidationError, yaml.YAMLError) as e:
+    except (ValidationError, yaml.YAMLError, OSError) as e:
         typer.echo(f"INVALID {path}: {e}", err=True)
         raise typer.Exit(code=1) from None
     typer.echo(f"OK {path}")

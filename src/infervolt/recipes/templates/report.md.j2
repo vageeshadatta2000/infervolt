@@ -31,7 +31,7 @@ Verified with {{ r.result.repeats }} interleaved repeats.
 | Knob | Baseline | Tuned |
 |---|---|---|
 {% for k, v in r.serve.args.items() %}
-| {{ k }} | {{ r.baseline.serve_args.get(k, '') }} | {{ v }} |
+| {{ k }} | {{ r.baseline.serve_args.get(k, '') | yamlish }} | {{ v | yamlish }} |
 {% endfor %}
 
 ## Search
@@ -42,7 +42,15 @@ Verified with {{ r.result.repeats }} interleaved repeats.
 ## Workload and SLO
 
 `{{ r.workload.name }}`: ISL p50 {{ r.workload.isl.p50 }}, OSL p50 {{ r.workload.osl.p50 }}, prefix share {{ r.workload.prefix_share }}.
-SLO: ttft {{ r.slo.ttft_ms }} ms, itl {{ r.slo.itl_ms }} ms, e2e {{ r.slo.e2e_ms }} ms at p{{ (r.slo.percentile * 100) | int }}.
+{% set parts = [] %}
+{% if r.slo.ttft_ms is not none %}{% set _ = parts.append('ttft %s ms' % r.slo.ttft_ms) %}{% endif %}
+{% if r.slo.itl_ms is not none %}{% set _ = parts.append('itl %s ms' % r.slo.itl_ms) %}{% endif %}
+{% if r.slo.e2e_ms is not none %}{% set _ = parts.append('e2e %s ms' % r.slo.e2e_ms) %}{% endif %}
+{% if parts %}
+SLO: {{ parts | join(', ') }} at p{{ (r.slo.percentile * 100) | int }}, goodput target {{ r.slo.goodput_target }}.
+{% else %}
+SLO: none (throughput only), goodput target {{ r.slo.goodput_target }}.
+{% endif %}
 
 ## Reproduce
 

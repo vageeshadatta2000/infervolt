@@ -49,9 +49,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/infervolt"]
-
-[tool.hatch.build]
-include = ["src/infervolt/**/*.py", "src/infervolt/**/*.j2", "src/infervolt/py.typed"]
+artifacts = ["*.j2"]
 
 [tool.ruff]
 line-length = 100

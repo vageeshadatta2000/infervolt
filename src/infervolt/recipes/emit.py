@@ -9,12 +9,25 @@ from jinja2 import Environment, PackageLoader, select_autoescape
 
 from infervolt.recipes.schema import Recipe
 
+
+def yamlish(value: object) -> object:
+    """Render booleans the way YAML and engine CLIs spell them; leave everything else alone."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return value
+
+
 _env = Environment(
+    # Autoescape is intentionally off: these templates render Markdown, not HTML, and
+    # HTML-escaping would mangle model ids, CLI flags and quoted knob values.
     loader=PackageLoader("infervolt.recipes", "templates"),
     autoescape=select_autoescape(default=False),
     trim_blocks=True,
     lstrip_blocks=True,
 )
+_env.filters["yamlish"] = yamlish
 
 
 def write_recipe(recipe: Recipe, out_dir: Path) -> Path:

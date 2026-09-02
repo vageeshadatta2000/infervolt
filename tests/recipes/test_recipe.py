@@ -32,6 +32,30 @@ def test_report_renders_key_sections() -> None:
     assert "kv_capacity" in md and "goodput_rps" in md and "Reproduce" in md
 
 
+def test_report_never_prints_none_and_shows_the_goodput_target() -> None:
+    recipe = Recipe.model_validate(yaml.safe_load(EXAMPLE.read_text()))
+    assert recipe.slo.e2e_ms is None  # the example leaves one SLO target unset
+    md = render_report(recipe)
+    assert "None" not in md
+    assert "goodput target" in md
+
+
+def test_report_renders_booleans_yaml_style() -> None:
+    recipe = Recipe.model_validate(yaml.safe_load(EXAMPLE.read_text()))
+    assert recipe.serve.args["enable_prefix_caching"] is True
+    md = render_report(recipe)
+    assert "| enable_prefix_caching | true | true |" in md
+    assert "True" not in md
+
+
+def test_report_says_throughput_only_when_no_slo_target_is_set() -> None:
+    recipe = Recipe.model_validate(yaml.safe_load(EXAMPLE.read_text()))
+    recipe.slo.ttft_ms = None
+    recipe.slo.itl_ms = None
+    md = render_report(recipe)
+    assert "SLO: none (throughput only)" in md
+
+
 def test_json_schema_export_has_required_top_level_keys() -> None:
     schema = recipe_json_schema()
     assert {"model", "hardware", "engine", "serve", "infervolt"} <= set(schema["required"])
@@ -45,3 +69,11 @@ def test_cli_recipe_validate(tmp_path: Path) -> None:
     bad.write_text("model: {id: x}\n")
     res = runner.invoke(app, ["recipe", "validate", str(bad)])
     assert res.exit_code == 1
+
+
+def test_cli_recipe_validate_missing_file_is_a_clean_usage_error(tmp_path: Path) -> None:
+    runner = CliRunner()
+    res = runner.invoke(app, ["recipe", "validate", str(tmp_path / "nope.yaml")])
+    assert res.exit_code == 2, res.output  # click's usage-error code, not a crash
+    assert not isinstance(res.exception, OSError)
+    assert "Traceback" not in res.output
