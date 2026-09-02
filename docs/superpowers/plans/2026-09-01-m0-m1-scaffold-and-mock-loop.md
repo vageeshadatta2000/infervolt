@@ -254,11 +254,23 @@ def get_settings() -> Settings:
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Annotated
+
 import typer
+import yaml
+from pydantic import ValidationError
 
 from infervolt import __version__
+from infervolt.config import Settings
+from infervolt.core.types import Budget, KnobValue, OptimizeSpec
+from infervolt.hardware.profiles import PROFILES
+from infervolt.recipes.schema import Recipe
+from infervolt.workloads.presets import parse_slo
 
 app = typer.Typer(help="Measure, diagnose, fix, verify, and remember LLM inference optimizations.")
+
+HOME_HELP = "State directory holding the ledger and run artifacts (default ~/.infervolt)."
 
 
 def _version_callback(value: bool) -> None:
@@ -274,6 +286,144 @@ def main(
     ),
 ) -> None:
     """infervolt CLI."""
+
+
+recipe_app = typer.Typer(help="Recipe utilities.")
+app.add_typer(recipe_app, name="recipe")
+
+
+def _settings(home: Path | None) -> Settings:
+    return Settings(home=home) if home else Settings()
+
+
+LLM_NAMES = ("fake", "anthropic", "openai")
+
+
+def _parse_kv(items: list[str]) -> dict[str, KnobValue]:
+    """Parse ``k=v`` overrides, narrowing each value to the tightest type it parses as.
+
+    Order matters: ``true``/``false`` before numbers (Python would read ``True`` as 1),
+    ints before floats (``64`` is a sequence count, not 64.0), and anything left is a
+    string -- which is what categorical knobs such as ``kv_cache_dtype=fp8`` want.
+
+    An item with no ``=`` is a usage error, not an empty-string override: ``--baseline
+    max_num_seqs 64`` (a space instead of an equals sign) would otherwise silently set
+    the knob to ``""`` and measure something nobody asked for.
+    """
+    out: dict[str, KnobValue] = {}
+    for item in items:
+        k, sep, v = item.partition("=")
+        if not sep or not k:
+            raise typer.BadParameter(f"expected knob=value, got {item!r}", param_hint="--baseline")
+        if v.lower() in ("true", "false"):
+            out[k] = v.lower() == "true"
+            continue
+        try:
+            out[k] = int(v)
+        except ValueError:
+            try:
+                out[k] = float(v)
+            except ValueError:
+                out[k] = v
+    return out
+
+
+@app.command()
+def optimize(
+    engine: str = typer.Option("mock", help="Engine adapter name (see entry points)."),
+    model: str = typer.Option(..., help="Model id, e.g. mock/qwen3-8b"),
+    hardware: str = typer.Option(
+        "auto", help="Hardware profile (a100-80, h100-80, rtx4090-24, l4-24, m3-8)."
+    ),
+    workload: str = typer.Option("chat-4k-512", help="Workload preset."),
+    slo: str = typer.Option("", help="SLO string, e.g. ttft=500ms,itl=30ms[,e2e=2s,p=0.9]"),
+    llm: str = typer.Option("fake", help="fake | anthropic | openai"),
+    max_trials: int = typer.Option(12, help="Trial budget for the search."),
+    max_wall_s: float = typer.Option(3600.0, help="Wall-clock budget in seconds."),
+    max_usd: float = typer.Option(
+        0.0,
+        help="Cost budget in USD; 0 means unlimited (cost accounting for real engines "
+        "arrives in M3; mock cost uses the profile's usd_per_hour).",
+    ),
+    seed: int = typer.Option(7, help="Sampler and load-generator seed."),
+    baseline: Annotated[
+        list[str] | None,
+        typer.Option("--baseline", help="Baseline knob override k=v (repeatable)."),
+    ] = None,
+    home: Annotated[Path | None, typer.Option(help=HOME_HELP)] = None,
+) -> None:
+    """Run the full loop and emit a recipe."""
+    from infervolt.agent.planner import Planner
+    from infervolt.llm.factory import make_llm
+    from infervolt.store.ledger import Ledger
+
+    if llm not in LLM_NAMES:
+        raise typer.BadParameter(
+            f"unknown llm {llm!r}; use {', '.join(LLM_NAMES)}", param_hint="--llm"
+        )
+    if hardware == "auto":
+        # The default is "auto" so that M2 can turn it on without changing anyone's
+        # command line; until then it is the one value the loop cannot serve, and saying
+        # so here is cheaper than a run that dies after opening a ledger row.
+        raise typer.BadParameter(
+            f"auto-detect arrives in M2; pass a profile name ({', '.join(sorted(PROFILES))})",
+            param_hint="--hardware",
+        )
+    settings = _settings(home)
+    spec = OptimizeSpec(
+        engine=engine,
+        model=model,
+        hardware=hardware,
+        workload=workload,
+        slo=parse_slo(slo),
+        budget=Budget(max_trials=max_trials, max_wall_s=max_wall_s, max_usd=max_usd),
+        baseline=_parse_kv(baseline or []),
+        seed=seed,
+        llm=llm,
+    )
+    with Ledger(settings.ledger_path, settings.runs_dir) as ledger:
+        outcome = Planner(spec, settings, make_llm(llm, settings), ledger, log=typer.echo).run()
+    if outcome.state != "done":
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def report(
+    run_id: str,
+    home: Annotated[Path | None, typer.Option(help=HOME_HELP)] = None,
+) -> None:
+    """Print the report for a run."""
+    from infervolt.store.ledger import Ledger
+
+    settings = _settings(home)
+    # The ledger is the authority on which runs exist, so an unknown id and a run that
+    # exists but produced no report get different answers -- "never heard of it" and "it
+    # got as far as <state>" are different problems with different next steps.
+    with Ledger(settings.ledger_path, settings.runs_dir) as ledger:
+        try:
+            row = ledger.get_run(run_id)
+        except KeyError:
+            typer.echo(f"unknown run {run_id}", err=True)
+            raise typer.Exit(code=1) from None
+        state = row.state
+    path = settings.runs_dir / run_id / "report.md"
+    if not path.exists():
+        typer.echo(f"no report for run {run_id} (state: {state})", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(path.read_text())
+
+
+@recipe_app.command("validate")
+def recipe_validate(
+    path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Validate a recipe.yaml against the infervolt schema."""
+    try:
+        Recipe.model_validate(yaml.safe_load(path.read_text()))
+    except (ValidationError, yaml.YAMLError, OSError) as e:
+        typer.echo(f"INVALID {path}: {e}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"OK {path}")
 
 
 if __name__ == "__main__":  # pragma: no cover
@@ -1809,9 +1959,18 @@ class RecipeServe(BaseModel):
     command: str = ""
 
 
+LOAD_POINT_DESC = (
+    "Concurrency the metrics were measured at. Baseline and tuned configs are each "
+    "reported at their own best load point, which is usually not the same number: a "
+    "config that holds more sequences serves its peak goodput further right. Without it "
+    "the summary table reads as two measurements of one operating point."
+)
+
+
 class RecipeMeasured(BaseModel):
     serve_args: dict[str, KnobValue] = Field(default_factory=dict)
     metrics: dict[str, float]
+    load_point: int | None = Field(default=None, description=LOAD_POINT_DESC)
 
 
 class RecipeQuality(BaseModel):
@@ -1822,6 +1981,7 @@ class RecipeQuality(BaseModel):
 
 class RecipeResult(BaseModel):
     metrics: dict[str, float]
+    load_point: int | None = Field(default=None, description=LOAD_POINT_DESC)
     repeats: int
     improvement: dict[str, str] = Field(default_factory=dict)
     quality: RecipeQuality | None = None
@@ -1837,6 +1997,13 @@ class RecipeDiagnosis(BaseModel):
     primary: Bottleneck
     confidence: float
     findings: list[RecipeFinding]
+    caveats: list[str] = Field(
+        default_factory=list,
+        description="What the diagnosis is not sure of -- a measurement artifact, a load "
+        "point that never saturated, a ranking that fell back to rule order because the "
+        "model was unavailable. The reader of a recipe is entitled to the same doubts the "
+        "run had.",
+    )
 
 
 class RecipeSearch(BaseModel):
@@ -1943,7 +2110,7 @@ Run `{{ r.infervolt.run_id }}` Â· created {{ r.infervolt.provenance.created }} Â
 
 ## Summary
 
-| Metric | Baseline | Tuned |
+| Metric | Baseline{% if r.baseline.load_point is not none %} (c={{ r.baseline.load_point }}){% endif %} | Tuned{% if r.result.load_point is not none %} (c={{ r.result.load_point }}){% endif %} |
 |---|---|---|
 {% for k, v in r.result.metrics.items() %}
 | {{ k }} | {{ '%.3f' % r.baseline.metrics.get(k, 0.0) }} | {{ '%.3f' % v }} |
@@ -1964,6 +2131,14 @@ Verified with {{ r.result.repeats }} interleaved repeats.
 {% for f in r.infervolt.diagnosis.findings %}
 | {{ f.rule }} | {{ '%.2f' % f.score }} | {% for e in f.evidence %}`{{ e.key }}`={{ '%.4g' % e.value }}{{ e.unit }}{% if not loop.last %}, {% endif %}{% endfor %} |
 {% endfor %}
+
+{% if r.infervolt.diagnosis.caveats %}
+Caveats from diagnosis:
+
+{% for c in r.infervolt.diagnosis.caveats %}
+- {{ c }}
+{% endfor %}
+{% endif %}
 
 ## Winning configuration
 
@@ -1993,6 +2168,20 @@ SLO: none (throughput only), goodput target {{ r.slo.goodput_target }}.
 
 ## Reproduce
 
+```bash
+{{ r.serve.command }}
+```
+
+## Next steps
+
+{% for s in r.infervolt.next_steps %}
+- {{ s }}
+{% endfor %}
+
+## Caveats
+
+- Measurements come from a synthetic or real load generator as recorded in `artifacts`; GPUs are not bit-reproducible, expect a few percent variance.
+- Provenance: llm `{{ r.infervolt.provenance.llm }}`, prompts `{{ r.infervolt.provenance.prompts_sha }}`.
 ```bash
 {{ r.serve.command }}
 ```
@@ -2929,6 +3118,31 @@ from infervolt.engines.mock.model import DEFAULT_KNOBS, OomError, PerfModel, Sim
 from infervolt.loadgen.base import LoadGenerator
 
 NOISE = 0.03
+"""Per-request coefficient of variation on the sampled TTFT and ITLs."""
+
+RUN_NOISE = 0.005
+MIN_RUN_FACTOR = 0.9
+"""Run-to-run variation in the load phase's wall clock, and the floor on the factor.
+
+Per-request noise averages out: sixteen requests of five hundred tokens each leave the
+*total* service time within a fraction of a percent of the model, so a duration derived
+from it alone is effectively deterministic and every repeat of a verify measures the
+same goodput to twelve digits. A real card does not behave that way -- clocks drift,
+power caps bite, the allocator lands differently -- and reported goodput moves by one to
+three percent between otherwise identical runs. Without that, ``verify`` accepts any
+config a hair above the baseline: the paired CI collapses onto the mean and the
+statistics stop being a test of anything.
+
+Half a percent sits under that band rather than inside it, because three repeats is a
+very small sample: the 95% paired interval is 4.303 sd/sqrt(3) wide, so a full percent
+of run noise gives a half-width of about 0.025 rps against the +0.018 rps that the kv
+scenario's fp8 KV cache actually buys -- a real win the tests could not tell from zero.
+The simulator's job is to exercise the statistics, not to defeat them.
+
+The floor keeps the factor positive with an enormous margin (0.9 is twenty sigma below
+the mean), because every rate in ``compute_metrics`` divides by ``duration_s``.
+"""
+
 MAX_MODEL_LEN_CHOICES: tuple[int, ...] = (4096, 8192, 16384, 32768)
 INT_KNOBS = frozenset({"max_num_seqs", "max_num_batched_tokens"})
 
@@ -2985,12 +3199,20 @@ class SimLoadGenerator:
             return LoadResult(concurrency=concurrency, duration_s=1.0, requests=failed)
         base_itl = max(p.step_floor_s * 0.5, p.itl_mean_s - p.n_spikes * p.itl_spike_s / osl)
         reqs: list[RequestRecord] = []
+        service_s = 0.0
         for _ in range(num_requests):
-            ttft = p.ttft_s * (1 + NOISE * rng.standard_normal())
+            eps = rng.standard_normal()
+            ttft = p.ttft_s * (1 + NOISE * eps)
             itl = base_itl * (1 + NOISE * rng.standard_normal(osl))
             if p.n_spikes:
                 idx = rng.choice(osl, size=p.n_spikes, replace=False)
                 itl[idx] += p.itl_spike_s
+            # The server's own share of this request: its sampled end-to-end time less
+            # the queue wait, which the closed loop below accounts for separately (see
+            # SimPoint: ttft_s is measured from arrival and so already contains it).
+            # Summed from the draws rather than from the model, so the duration inherits
+            # the sampling noise instead of being computed around it.
+            service_s += (p.ttft_s - p.queue_wait_s) * (1 + NOISE * eps) + float(itl.sum())
             reqs.append(
                 RequestRecord(
                     ttft_s=float(max(ttft, 1e-4)),
@@ -2998,13 +3220,17 @@ class SimLoadGenerator:
                     output_tokens=osl,
                 )
             )
-        # Closed loop: ``running`` requests are in service at once and each takes
-        # ``lifetime_s``, so completions retire at running/lifetime_s. Queue wait is the
-        # time the *waiting* requests spend outside the server -- it lengthens each
-        # request's residence time, not the rate the server clears them -- so adding it
-        # here would double-count it. Little's law is the check: the resulting rate times
-        # (queue_wait_s + lifetime_s) comes back to exactly ``concurrency``.
-        duration = num_requests * p.lifetime_s / p.running
+        # Closed loop: ``running`` requests are in service at once, so the whole batch
+        # takes the total service time divided by ``running``. Queue wait is the time the
+        # *waiting* requests spend outside the server -- it lengthens each request's
+        # residence time, not the rate the server clears them -- which is why it was
+        # subtracted above rather than summed here. Preemption stretches every request's
+        # service by the same factor, so it multiplies the total rather than being
+        # sampled per request. Little's law is the check on all of it: the resulting rate
+        # times (queue_wait_s + lifetime_s) comes back to ``concurrency``, now within the
+        # run noise rather than exactly.
+        duration = service_s / p.running * (1 + p.preempt_frac)
+        duration *= max(1 + RUN_NOISE * rng.standard_normal(), MIN_RUN_FACTOR)
         return LoadResult(concurrency=concurrency, duration_s=float(duration), requests=reqs)
 
 
@@ -3033,6 +3259,12 @@ class MockAdapter(EngineAdapter):
 
     def knob_space(self, ctx: RunContext) -> KnobSpace:
         d = DEFAULT_KNOBS
+        # Only the lengths that cover the workload are offered. A shorter one is not a
+        # bad idea the search should be allowed to test and reject -- ``validate``
+        # rejects it outright -- so keeping it in ``choices`` would only spend trials
+        # and inflate the space the novelty filter measures distances across.
+        min_len = self._default_max_model_len(ctx)
+        len_choices = [c for c in MAX_MODEL_LEN_CHOICES if c >= min_len] or [min_len]
         return KnobSpace(
             knobs=[
                 Knob(
@@ -3066,8 +3298,8 @@ class MockAdapter(EngineAdapter):
                     name="max_model_len",
                     kind="cat",
                     groups=["kv"],
-                    default=self._default_max_model_len(ctx),
-                    choices=list(MAX_MODEL_LEN_CHOICES),
+                    default=min_len,
+                    choices=list(len_choices),
                 ),
                 Knob(
                     name="enable_prefix_caching",
@@ -4567,15 +4799,25 @@ def _provider_errors() -> tuple[type[BaseException], ...]:
 class AnthropicClient:
     def __init__(self, model_id: str = "claude-opus-5", client: Any | None = None) -> None:
         self.model_id = model_id
-        if client is None:
+        self._client: Any | None = client
+
+    def _sdk(self) -> Any:
+        """The SDK client, built on first use.
+
+        Constructing it is what discovers a missing ``ANTHROPIC_API_KEY``, so it happens
+        inside ``structured`` where that failure becomes an :class:`LLMError` the loop can
+        degrade around -- rather than at construction, where it would kill a run that had
+        every measurement it needed and only wanted prose.
+        """
+        if self._client is None:
             import anthropic
 
-            client = anthropic.Anthropic()
-        self._client: Any = client
+            self._client = anthropic.Anthropic()
+        return self._client
 
     def structured(self, *, system: str, user: str, schema: type[T]) -> T:
         try:
-            response = self._client.messages.parse(
+            response = self._sdk().messages.parse(
                 model=self.model_id,
                 max_tokens=16000,
                 system=system,
@@ -4585,6 +4827,14 @@ class AnthropicClient:
         except _provider_errors() as e:
             # Callers up the loop handle one failure type from every client. A bare
             # SDK/transport error leaking out would make each of them import the SDKs.
+            raise LLMError(f"anthropic: {type(e).__name__}: {e}") from e
+        except Exception as e:  # noqa: BLE001 - see below: every escape here is the SDK's
+            # The tuple above is the documented set, but it does not cover everything the
+            # SDK raises: a missing ``ANTHROPIC_API_KEY`` surfaces as a plain ``TypeError``
+            # from the constructor at the first call, and auth/config mistakes generally
+            # arrive as builtins. This frame only ever calls into the SDK, so anything
+            # that escapes it is the provider failing, and a caller that degrades on
+            # ``LLMError`` should degrade on a missing key too rather than die.
             raise LLMError(f"anthropic: {type(e).__name__}: {e}") from e
         if getattr(response, "stop_reason", None) == "refusal":
             raise LLMError("model refused the request")
@@ -4655,11 +4905,23 @@ class OpenAICompatClient:
         client: Any | None = None,
     ) -> None:
         self.model_id = model_id
-        if client is None:
+        self._base_url = base_url
+        self._api_key = api_key
+        self._client: Any | None = client
+
+    def _sdk(self) -> Any:
+        """The SDK client, built on first use.
+
+        As in ``anthropic_client``: a bad key or unreachable base URL should surface as an
+        :class:`LLMError` from ``structured``, which the loop degrades around, not as a
+        constructor blowing up before the run starts.
+        """
+        if self._client is None:
             import openai
 
-            client = openai.OpenAI(base_url=base_url, api_key=api_key)  # api_key is a plain str
-        self._client: Any = client
+            # api_key is a plain str by the time it reaches here.
+            self._client = openai.OpenAI(base_url=self._base_url, api_key=self._api_key)
+        return self._client
 
     def structured(self, *, system: str, user: str, schema: type[T]) -> T:
         messages: list[dict[str, str]] = [
@@ -4673,12 +4935,18 @@ class OpenAICompatClient:
         last_error = ""
         for _ in range(2):
             try:
-                resp = self._client.chat.completions.create(
+                resp = self._sdk().chat.completions.create(
                     model=self.model_id, messages=messages, response_format=fmt
                 )
             except _provider_errors() as e:
                 # A transport or API failure is not something a repair round trip can
                 # fix, so it ends the loop instead of burning the retry.
+                raise LLMError(f"openai: {type(e).__name__}: {e}") from e
+            except Exception as e:  # noqa: BLE001 - this frame only ever calls the SDK
+                # The tuple above is the documented set; construction and auth mistakes
+                # arrive as builtins (a missing key is a ``TypeError``/``OpenAIError``).
+                # Everything reachable from here is the provider, so everything that
+                # escapes it is a provider failure the caller should degrade around.
                 raise LLMError(f"openai: {type(e).__name__}: {e}") from e
             text = resp.choices[0].message.content or ""
             for candidate in _json_candidates(text):
@@ -4933,10 +5201,19 @@ def _numeric_choices(k: Knob) -> list[float] | None:
     return sorted(float(c) for c in k.choices)
 
 
-BACKOFF: dict[str, Callable[[float], float]] = {
-    "gpu_memory_utilization": lambda v: round(v - 0.05, 2),
+UTIL_KNOB = "gpu_memory_utilization"
+UTIL_STEP = 0.05
+"""One notch of ``gpu_memory_utilization``: the unit both the floor and the ceiling move in."""
+
+KV_BACKOFF: dict[str, Callable[[float], float]] = {
     "max_model_len": lambda v: v / 2,
     "max_num_seqs": lambda v: v - 1,
+}
+"""How far each *token* knob retreats from a config the KV cache could not hold."""
+
+BACKOFF: dict[str, Callable[[float], float]] = {
+    UTIL_KNOB: lambda v: round(v - UTIL_STEP, 2),
+    **KV_BACKOFF,
 }
 """How far each memory knob retreats from a value that just ran out of memory.
 
@@ -4945,12 +5222,21 @@ because the goal is to leave the region that failed, not to bisect it. Knobs abs
 this table are not memory knobs and are never tightened.
 """
 
+WEIGHTS_OOM_MARKERS = ("CUDA out of memory", "OutOfMemoryError")
+"""Log fragments that say the allocator ran dry putting *weights and reserve* on the card."""
+
+KV_OOM_MARKER = "larger than the maximum number of tokens"
+"""The log fragment that says the KV cache could not hold ``max_model_len`` tokens."""
+
 
 class Bounds:
-    """Upper bounds per knob, lowered whenever a config runs out of memory.
+    """The live floor and ceiling of every numeric knob, moved by what OOMs teach.
 
-    Only knobs with a numeric ceiling appear in ``high``; a categorical knob such as
-    ``kv_cache_dtype`` has no direction to back off in and is left out entirely.
+    Only knobs with a numeric range appear in ``high`` and ``low``; a categorical knob
+    such as ``kv_cache_dtype`` has no direction to back off in and is left out entirely.
+
+    Ceilings only fall and floors only rise, so the feasible box shrinks monotonically:
+    the search never re-enters a region a crash has already ruled out.
     """
 
     def __init__(self, space: KnobSpace) -> None:
@@ -4982,13 +5268,65 @@ class Bounds:
             if proposed >= self.low[name]:
                 self.high[name] = min(self.high[name], proposed)
 
+    def tighten_on_weights_oom(self, knobs: dict[str, KnobValue]) -> None:
+        """Raise the ``gpu_memory_utilization`` floor after an OOM caused by too *small* a budget.
+
+        An allocator that died fitting weights and its reserve was not given enough of
+        the card, so the fix points the opposite way from a KV overflow: the next config
+        needs a *higher* utilisation, not a shorter context. Tightening the token
+        ceilings here would be actively wrong -- it would shrink the very knobs that had
+        nothing to do with the failure, while leaving the sampler free to propose the
+        same starved utilisation again.
+
+        The new floor is capped at the knob's current ceiling so the range can never
+        invert, and only ever rises, so a later, smaller OOM teaches nothing.
+        """
+        value = knobs.get(UTIL_KNOB)
+        if UTIL_KNOB not in self.low or value is None or isinstance(value, (bool, str)):
+            return
+        proposed = min(round(float(value) + UTIL_STEP, 2), self.high[UTIL_KNOB])
+        self.low[UTIL_KNOB] = max(self.low[UTIL_KNOB], proposed)
+
+    def tighten_on_kv_oom(self, knobs: dict[str, KnobValue]) -> None:
+        """Lower the token ceilings after a config the KV cache could not hold.
+
+        The engine said in as many words that ``max_model_len`` exceeded the cache, so
+        the guilty knobs are known and ``gpu_memory_utilization`` is not among them --
+        it is already as high as it was asked to be, and lowering it would only make the
+        cache smaller still.
+        """
+        for name, value in knobs.items():
+            back_off = KV_BACKOFF.get(name)
+            if back_off is None or name not in self.high or isinstance(value, (bool, str)):
+                continue
+            proposed = back_off(float(value))
+            if proposed >= self.low[name]:
+                self.high[name] = min(self.high[name], proposed)
+
+    def tighten_for(self, log_tail: str, knobs: dict[str, KnobValue]) -> None:
+        """Apply whichever OOM rule ``log_tail`` identifies.
+
+        An OOM is only a useful lesson if the search learns the right direction from it,
+        and the engine's own message says which direction that is. Only when the log
+        names neither cause does the conservative rule apply -- blaming every memory
+        knob at once, which is safe but throws away range the failure never condemned.
+        """
+        if any(marker in log_tail for marker in WEIGHTS_OOM_MARKERS):
+            self.tighten_on_weights_oom(knobs)
+        elif KV_OOM_MARKER in log_tail:
+            self.tighten_on_kv_oom(knobs)
+        else:
+            self.tighten_on_oom(knobs)
+
 
 def clamp(knobs: dict[str, KnobValue], space: KnobSpace, bounds: Bounds) -> dict[str, KnobValue]:
-    """Pull every knob down to its current ceiling, preserving each knob's type.
+    """Pull every knob into ``[low, high]``, preserving each knob's type.
 
-    Categorical knobs snap to the largest *offered* choice at or below the ceiling, so a
-    clamped ``max_model_len`` is still a value the engine accepts. Knobs the bounds do
-    not track, and knobs absent from ``knobs``, pass through untouched.
+    Both directions matter: an OOM that blamed too little memory *raises* a floor, and a
+    proposal under that floor is as dead as one over a ceiling. Categorical knobs snap to
+    an *offered* choice inside the window, so a clamped ``max_model_len`` is still a
+    value the engine accepts. Knobs the bounds do not track, and knobs absent from
+    ``knobs``, pass through untouched.
     """
     out: dict[str, KnobValue] = dict(knobs)
     for k in space.knobs:
@@ -4997,19 +5335,19 @@ def clamp(knobs: dict[str, KnobValue], space: KnobSpace, bounds: Bounds) -> dict
         v = out[k.name]
         if isinstance(v, (bool, str)):
             continue
-        hi = bounds.high[k.name]
+        hi, lo = bounds.high[k.name], bounds.low[k.name]
         if k.kind == "int":
-            out[k.name] = min(int(v), int(hi))
+            out[k.name] = max(min(int(v), int(hi)), math.ceil(lo))
         elif k.kind == "float":
-            out[k.name] = min(float(v), hi)
+            out[k.name] = max(min(float(v), hi), lo)
         else:
             nc = _numeric_choices(k) or []
-            allowed = [c for c in nc if c <= hi]
+            allowed = [c for c in nc if lo <= c <= hi]
             if not allowed:
-                # Nothing the engine offers is under the ceiling, so there is no valid
+                # Nothing the engine offers is inside the window, so there is no valid
                 # value to snap to; leave the knob and let validation say so.
                 continue
-            capped = min(float(v), allowed[-1])
+            capped = max(min(float(v), allowed[-1]), allowed[0])
             out[k.name] = int(capped) if all(c.is_integer() for c in nc) else capped
     return out
 
@@ -5072,10 +5410,10 @@ novelty filter refuses to spend a trial on a config the run has already measured
 crash is a *result*: an OOM tightens :class:`~infervolt.search.space.Bounds` so the
 sampler stops proposing configs that cannot launch, rather than being retried.
 
-Every candidate is measured twice: a cheap stage 1 at the baseline's best load point,
-then -- only if it beats the median of the stage-1 scores so far -- a full sweep at
-stage 2. That is ASHA's idea with a single rung, and it is what keeps a search of a
-dozen candidates inside a trial budget meant for half that many.
+Every candidate is measured twice: a cheap stage 1 over :func:`_stage1_points`, then --
+only if it beats the median of the stage-1 scores so far -- a full sweep at stage 2. That
+is ASHA's idea with a single rung, and it is what keeps a search of a dozen candidates
+inside a trial budget meant for half that many.
 """
 
 from __future__ import annotations
@@ -5083,7 +5421,6 @@ from __future__ import annotations
 import statistics
 import time
 import uuid
-import warnings
 from collections.abc import Callable
 from typing import cast
 
@@ -5118,14 +5455,18 @@ A sampler that keeps proposing points the run has already measured has exhausted
 region it believes in; more asks would only spend wall-clock.
 """
 
+MAX_REJECTS = 20
+"""Statically rejected configs tolerated before giving up on the sub-space.
+
+A rejected config costs no GPU time, but it is not free either: it consumes a trial from
+the budget and teaches TPE only :data:`WORST`. Twenty in a row means the sub-space the
+planner chose does not fit this engine and hardware, which more asks will not fix.
+"""
+
 STAGE1_REQUESTS = 8
 STAGE2_REQUESTS = 16
 MIN_STAGE1_BEFORE_PRUNE = 3
 """Stage-1 scores needed before a median is worth pruning against."""
-
-# ``multivariate=True`` is still flagged experimental upstream, and the sampler is chatty
-# about every enqueued trial. Neither is news to a user running a search.
-warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
 
 
 def _suggest(trial: optuna.Trial, k: Knob) -> KnobValue:
@@ -5152,6 +5493,28 @@ def _suggest(trial: optuna.Trial, k: Knob) -> KnobValue:
     return cast(KnobValue, trial.suggest_categorical(k.name, k.choices))
 
 
+def _stage1_points(concurrency: list[int], best_load_point: int) -> list[int]:
+    """The baseline's best load point, plus the next one up if the sweep offers one.
+
+    A single point at the baseline's own knee is not enough to rank capacity candidates.
+    Below saturation every config that launches serves the offered load at roughly the
+    same rate, so a knob that buys *headroom* -- a bigger KV cache, more sequences in
+    flight -- looks identical to the baseline there and gets pruned before the stage-2
+    sweep that would have shown the win. The next point up is where the baseline is
+    already past its knee and the extra capacity turns into goodput, which is exactly
+    the difference stage 1 has to be able to see.
+
+    Two points, not the whole sweep: stage 1 exists to be cheap, and the pair straddling
+    the knee carries nearly all of the ranking signal the full sweep would.
+    """
+    points = [best_load_point]
+    if best_load_point in concurrency:
+        nxt = concurrency.index(best_load_point) + 1
+        if nxt < len(concurrency):
+            points.append(concurrency[nxt])
+    return points
+
+
 def run_search(
     adapter: EngineAdapter,
     ctx: RunContext,
@@ -5175,9 +5538,13 @@ def run_search(
     """
     assert baseline.result is not None
     sub = space.subspace(plan.subspaces)
-    if not sub.knobs:
-        return []
     base_cfg = baseline.candidate.config.with_knobs(**plan.fixed)
+    # A knob the plan pinned is not a knob the sampler gets to touch. Suggesting it and
+    # then letting ``base_cfg`` win would leave TPE modelling a dimension that never
+    # varies, and suggesting it and letting it win would break the pin outright.
+    search_knobs = [k for k in sub.knobs if k.name not in plan.fixed]
+    if not search_knobs:
+        return []
     bounds = Bounds(sub)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
@@ -5185,10 +5552,10 @@ def run_search(
         sampler=optuna.samplers.TPESampler(seed=seed, multivariate=True, n_startup_trials=3),
     )
     # Priors go in ahead of anything TPE would pick, and are recognised on the way back
-    # out by config key so the trial can carry the planner's hypothesis.
+    # out by the *suggested* params so the trial can carry the planner's hypothesis.
     prior_hypotheses: dict[str, str] = {}
     for p in plan.priors:
-        params = {k.name: p.config.knobs[k.name] for k in sub.knobs if k.name in p.config.knobs}
+        params = {k.name: p.config.knobs[k.name] for k in search_knobs if k.name in p.config.knobs}
         if params:
             study.enqueue_trial(params, skip_if_exists=True)
             prior_hypotheses[base_cfg.with_knobs(**params).key()] = p.hypothesis
@@ -5198,24 +5565,36 @@ def run_search(
     trials: list[Trial] = []
     stage1_scores: list[float] = []
     max_trials = min(plan.max_trials, budget.max_trials)
-    skips = 0
-    index = len(prior_trials)
-    stage1_c = [baseline.result.best_load_point]
+    skips = rejects = 0
+    # Index off the highest the ledger holds, not the count: the baseline is index 0, so
+    # counting would leave a gap and re-derive an id another trial may already own.
+    index = max((t.index for t in prior_trials), default=-1)
+    stage1_c = _stage1_points(ctx.workload.load.concurrency, baseline.result.best_load_point)
     stage2_c = ctx.workload.load.concurrency
     while (
         len(trials) < max_trials
         and skips < MAX_SKIPS
+        and rejects < MAX_REJECTS
         and (deadline is None or time.time() < deadline)
     ):
         ot = study.ask()
-        params = clamp({k.name: _suggest(ot, k) for k in sub.knobs}, sub, bounds)
-        cfg = base_cfg.with_knobs(**params)
+        raw = {k.name: _suggest(ot, k) for k in search_knobs}
+        # Attribution is keyed on what the sampler proposed, before ``clamp`` touches it:
+        # a prior asking for one more sequence than an OOM has since left room for is
+        # still the planner's hypothesis, and the trial has to say so.
+        hypothesis = prior_hypotheses.get(base_cfg.with_knobs(**raw).key(), "")
+        cfg = base_cfg.with_knobs(**clamp(raw, sub, bounds))
         if not is_novel(cfg.knobs, seen, sub):
-            study.tell(ot, state=optuna.trial.TrialState.PRUNED)
+            # FAIL rather than PRUNED. Optuna drops failed trials from TPE's observations
+            # entirely, which is the truth here: nothing was measured. A pruned trial, by
+            # contrast, ranks below every complete one, so reporting a duplicate as
+            # PRUNED would teach the sampler to avoid the neighbourhood of a config we
+            # already measured -- and the likeliest reason we measured it is that it was
+            # good.
+            study.tell(ot, state=optuna.trial.TrialState.FAIL)
             skips += 1
             continue
         seen.append(cfg.knobs)
-        hypothesis = prior_hypotheses.get(cfg.key(), "")
         index += 1
         trial = Trial(
             id=f"t{index}",
@@ -5235,6 +5614,7 @@ def run_search(
         if s1 is None:
             # Crashed, was rejected, or served nothing measurable. Either way it produced
             # no score to rank against, so it is not part of the pruning median.
+            rejects += trial.status == "rejected"
             _tighten_if_oom(bounds, trial)
             study.tell(ot, WORST)
             _record(ledger, trial, trials, on_trial)
@@ -5252,6 +5632,12 @@ def run_search(
         trial = run_candidate(adapter, trial, ctx, stage2_c, STAGE2_REQUESTS)
         s2 = _score(trial)
         _tighten_if_oom(bounds, trial)
+        # TPE sees two scales at once: pruned trials reported at their stage-1 score over
+        # two load points, promoted ones at their stage-2 score over the full sweep. The
+        # mixing is deliberate -- a pruned trial's own number is still a better signal
+        # than WORST -- and harmless in practice because stage 1 straddles the knee and
+        # so tracks the sweep's ordering, but it does mean the sampler's objective is not
+        # a single well-defined quantity. Worth revisiting if the two ever disagree.
         study.tell(ot, WORST if s2 is None else s2)
         _record(ledger, trial, trials, on_trial)
     return trials
@@ -5271,9 +5657,14 @@ def _score(trial: Trial) -> float | None:
 
 
 def _tighten_if_oom(bounds: Bounds, trial: Trial) -> None:
-    """Lower the ceilings if this trial died out of memory."""
+    """Move the bounds if this trial died out of memory, in whichever direction it says.
+
+    The engine's own message distinguishes the two OOMs that point opposite ways -- too
+    little memory reserved for weights, versus a KV cache too small for the context --
+    so the log tail is passed along rather than thrown away.
+    """
     if trial.crash_kind == "oom":
-        bounds.tighten_on_oom(trial.candidate.config.knobs)
+        bounds.tighten_for(trial.log_tail, trial.candidate.config.knobs)
 
 
 def _record(
@@ -5360,7 +5751,12 @@ Expected: FAIL with `ModuleNotFoundError`.
 
 `src/infervolt/verify/quality.py`:
 ```python
-"""Quality guard: accuracy recovery check for knobs that change numerics."""
+"""Quality guard: accuracy recovery check for knobs that change numerics.
+
+A speed win bought by changing what the model computes is not a win until someone
+checks the answers still hold. Only a few knobs can do that, so only they trigger an
+eval -- see :data:`QUALITY_KNOBS`.
+"""
 
 from __future__ import annotations
 
@@ -5369,10 +5765,22 @@ from typing import Protocol
 from infervolt.core.types import EngineConfig, KnobValue, QualityScore, RunContext
 
 QUALITY_KNOBS = {"kv_cache_dtype", "quantization", "speculative"}
+"""Knobs that change the numerics of generation, and so can move accuracy.
+
+Everything else -- batch sizes, memory fractions, scheduling -- changes *when* work is
+done, not what it computes, and needs no eval.
+"""
+
 RECOVERY_MIN = {"fp8": 0.99, "int4": 0.97, "default": 0.99}
+"""Minimum share of the unquantized score a config must recover, by weight quantization."""
 
 
 def needs_quality_guard(before: dict[str, KnobValue], after: dict[str, KnobValue]) -> bool:
+    """True when the move touched a numerics-changing knob.
+
+    Compared with ``.get`` on both sides so a knob that appears or disappears counts as
+    a change, not as equal-by-absence.
+    """
     return any(before.get(k) != after.get(k) for k in QUALITY_KNOBS)
 
 
@@ -5397,91 +5805,280 @@ class MockQualityGuard:
 
 
 def recovery_threshold(cfg: EngineConfig) -> float:
+    """The recovery floor for ``cfg``, keyed on its weight quantization.
+
+    Lower-precision weights are allowed to lose more, because the speedup they buy is
+    larger; anything else -- including an unquantized config whose KV cache went fp8 --
+    is held to the default.
+    """
     q = str(cfg.knobs.get("quantization", "none"))
     return RECOVERY_MIN.get(q, RECOVERY_MIN["default"])
 ```
 
 `src/infervolt/verify/verify.py`:
 ```python
-"""Interleaved baseline/candidate repeats with a paired-t confidence interval on goodput."""
+"""Interleaved baseline/candidate repeats with a paired-t confidence interval on goodput.
+
+The search's best trial was measured once, against a baseline measured at a different
+moment. Verify re-measures both, alternating arms within each repeat so that any drift
+over the verification window -- a warming card, a noisy neighbour, a background job --
+lands on both arms rather than on whichever ran second. The repeats are therefore
+*paired*: the statistic is the per-repeat difference, and the claim is accepted only
+when the 95% CI of that difference clears zero.
+"""
 
 from __future__ import annotations
 
+import contextlib
 import math
 import statistics
+from typing import NamedTuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from infervolt.core.types import QualityScore, RunContext, Trial
 from infervolt.engines.base import EngineAdapter, LaunchError
 from infervolt.runner.trial import run_load_point
 from infervolt.verify.quality import QualityGuard, needs_quality_guard, recovery_threshold
 
-T_975 = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571, 10: 2.262}
+T_975 = {
+    2: 12.706,
+    3: 4.303,
+    4: 3.182,
+    5: 2.776,
+    6: 2.571,
+    7: 2.447,
+    8: 2.365,
+    9: 2.306,
+    10: 2.262,
+}
+"""Two-sided 95% critical values of Student's t, keyed by *sample size* n (df = n - 1).
+
+The table stops at n = 10 because verification runs are short by construction -- three
+repeats is the default, ten an extravagance. Any n outside the table falls back to
+:data:`T_FALLBACK`; the table is only worth carrying at all because at the sizes we
+actually use (n = 3 gives 4.303) the normal approximation would be far too narrow and
+would accept noise as a win.
+"""
+
+T_FALLBACK = 2.228
+"""The df = 10 critical value, used for every n outside :data:`T_975`.
+
+Student's t shrinks monotonically towards 1.96 as df grows, so the value for the largest
+df in the table is an upper bound for every n >= 11: the interval it produces is never
+narrower than the correct one, and a verification that errs is meant to err towards
+rejecting. The normal limit itself, 1.96, would be an under-estimate at every finite n.
+"""
+
+MIN_EFFECT_FRAC = 0.01
+"""Smallest relative gain worth calling a win.
+
+Separation from zero is a statement about confidence, not about size: with enough
+repeats a reliably reproducible 0.1% clears the interval test and is still not worth
+rewriting a production config for. This floor is what keeps "statistically significant"
+from being mistaken for "significant".
+"""
+
+READY_TIMEOUT_S = 900.0
+"""How long a re-measured arm gets to come up. Fifteen minutes covers a cold vLLM start."""
+
 VERIFY_REQUESTS = 16
 
 
 class VerifyResult(BaseModel):
+    # improvement_pct is infinite against a baseline that served nothing, and plain JSON
+    # has no spelling for that; "strings" emits "Infinity", which parses straight back.
+    model_config = ConfigDict(ser_json_inf_nan="strings")
+
     accepted: bool
     repeats: int
     load_point: int
     baseline_goodput: list[float]
     candidate_goodput: list[float]
+    baseline_mean: float = Field(
+        default=0.0, description="Mean goodput of the baseline arm over the repeats."
+    )
+    comparable: bool = Field(
+        default=False,
+        description="Whether the baseline had a rate to express the win as a fraction of. "
+        "Both arms are driven at the *candidate's* best load point, which the baseline may "
+        "not reach at all -- a config that OOMs or misses every deadline there scores a "
+        "clean zero -- and there is no percentage of zero. False says to report the gain in "
+        "absolute rps instead; it says nothing about whether the result was accepted.",
+    )
     delta_mean: float
     ci_low: float
     ci_high: float
     improvement_pct: float
     quality: QualityScore | None = None
     reason: str = ""
+    errors: list[str] = Field(
+        default_factory=list,
+        description="One entry per repeat that failed to measure, tagged with its arm and "
+        "index (``baseline[1]``, ``candidate[0]``) -- a launch that died, a server that "
+        "never came up, an adapter that raised, or an observation the runner ruled "
+        "invalid. Each of those scored 0.0, so any entry here is on its own grounds for "
+        "rejection: an unmeasured arm is not an arm that lost.",
+    )
+
+
+def improvement_pct(mean: float, base_mean: float) -> float:
+    """The mean delta as a percentage of the baseline, or infinity when there is no baseline.
+
+    Verification drives both arms at the *candidate's* best load point, which the
+    baseline may not reach at all: a config that OOMs there, or misses every deadline,
+    scores a clean zero. There is no ratio to a zero, and reporting 0.0 would say "no
+    change" about the one case where the change is total, so the answer is infinite and
+    callers are expected to word it in absolute terms instead.
+    """
+    if base_mean <= 0:
+        return math.inf if mean > 0 else 0.0
+    return mean / base_mean * 100
 
 
 def paired_ci(deltas: list[float]) -> tuple[float, float, float]:
+    """``(ci_low, ci_high, mean)`` for the 95% t interval around the mean difference.
+
+    Fewer than two samples has no spread to estimate, so the interval collapses to the
+    mean -- which ``verify`` then reads as "not separated from zero" unless the mean
+    itself is positive. An empty list is treated as a zero mean rather than an error:
+    every repeat having failed is a verdict, not a crash.
+    """
     n = len(deltas)
+    if n == 0:
+        return 0.0, 0.0, 0.0
     mean = statistics.fmean(deltas)
     if n < 2:
         return mean, mean, mean
     sd = statistics.stdev(deltas)
-    t = T_975.get(n, 2.0)
-    half = t * sd / math.sqrt(n)
+    half = T_975.get(n, T_FALLBACK) * sd / math.sqrt(n)
     return mean - half, mean + half, mean
 
 
-def _goodput_at(adapter: EngineAdapter, ctx: RunContext, trial: Trial, c: int, seed: int) -> float:
+class _Point(NamedTuple):
+    """One measured repeat: its goodput, whether it counted, and why if it did not."""
+
+    goodput: float
+    valid: bool
+    error: str = ""
+
+
+def _goodput_at(adapter: EngineAdapter, ctx: RunContext, trial: Trial, c: int, seed: int) -> _Point:
+    """Measure one arm once, at load point ``c`` and this repeat's ``seed``.
+
+    This never raises. A repeat that cannot be measured -- the config OOMs on launch, the
+    server never becomes ready, the adapter throws, the runner rules the observation
+    invalid -- scores 0.0 and says so. Anything else would let one bad repeat abort a
+    verification whose other repeats were fine, and a verify that crashes is strictly
+    worse than one that reports a rejection.
+    """
     cfg = trial.candidate.config
     try:
         handle = adapter.launch(cfg, ctx)
-    except LaunchError:
-        return 0.0
+    except LaunchError as e:
+        return _Point(0.0, False, f"launch failed: {e.exit.log_tail[-200:]}")
+    except Exception as e:  # noqa: BLE001 - an adapter bug is one dead repeat, not a dead run
+        return _Point(0.0, False, f"launch raised {type(e).__name__}: {e}")
     handle.config = cfg
     try:
-        adapter.ready(handle, 900.0)
-        obs, _ = run_load_point(adapter, handle, ctx.model_copy(update={"seed": seed}), c, VERIFY_REQUESTS)
+        if not adapter.ready(handle, READY_TIMEOUT_S):
+            return _Point(0.0, False, "server never became ready")
+        obs, _ = run_load_point(
+            adapter, handle, ctx.model_copy(update={"seed": seed}), c, VERIFY_REQUESTS
+        )
+    except Exception as e:  # noqa: BLE001 - same: this repeat is lost, the rest are not
+        return _Point(0.0, False, f"load point raised {type(e).__name__}: {e}")
     finally:
-        adapter.stop(handle)
-    return obs.metrics.goodput_rps if obs.valid else 0.0
+        # As in the runner: teardown is best-effort and must not mask the measurement it
+        # was tearing down, nor turn a finished repeat into an exception.
+        with contextlib.suppress(Exception):
+            adapter.stop(handle)
+    if not obs.valid:
+        return _Point(0.0, False, obs.invalid_reason or "invalid observation")
+    return _Point(obs.metrics.goodput_rps, True)
 
 
-def verify(adapter: EngineAdapter, ctx: RunContext, baseline: Trial, candidate: Trial, guard: QualityGuard, repeats: int = 3) -> VerifyResult:
-    assert candidate.result is not None
+def verify(
+    adapter: EngineAdapter,
+    ctx: RunContext,
+    baseline: Trial,
+    candidate: Trial,
+    guard: QualityGuard,
+    repeats: int = 3,
+) -> VerifyResult:
+    """Re-measure both arms ``repeats`` times, interleaved, and decide whether to accept.
+
+    Both arms are driven at the *candidate's* best load point: that is the operating
+    point the recipe will claim, so it is the one the comparison has to be about.
+    """
+    if repeats < 2:
+        # One repeat has no spread to estimate, so paired_ci collapses the interval onto
+        # the mean and every positive delta -- noise included -- clears zero. A "verified"
+        # win from a single pair of measurements is exactly what this function exists to
+        # rule out.
+        raise ValueError(f"repeats must be >= 2, got {repeats}")
+    if candidate.result is None:
+        raise ValueError("candidate has no result to verify; run it before verifying it")
     c = candidate.result.best_load_point
-    b_vals: list[float] = []
-    c_vals: list[float] = []
+    b_points: list[_Point] = []
+    c_points: list[_Point] = []
     for i in range(repeats):
-        b_vals.append(_goodput_at(adapter, ctx, baseline, c, ctx.seed + 100 + i))
-        c_vals.append(_goodput_at(adapter, ctx, candidate, c, ctx.seed + 200 + i))
+        # B, C, B, C, ... -- alternating, and a fresh seed per repeat per arm so the
+        # repeats are independent draws rather than the same draw measured twice.
+        b_points.append(_goodput_at(adapter, ctx, baseline, c, ctx.seed + 100 + i))
+        c_points.append(_goodput_at(adapter, ctx, candidate, c, ctx.seed + 200 + i))
+    b_vals = [p.goodput for p in b_points]
+    c_vals = [p.goodput for p in c_points]
+    errors = [
+        f"{arm}[{i}]: {p.error or 'invalid observation'}"
+        for arm, points in (("baseline", b_points), ("candidate", c_points))
+        for i, p in enumerate(points)
+        if not p.valid or p.error
+    ]
     deltas = [cv - bv for bv, cv in zip(b_vals, c_vals, strict=True)]
     lo, hi, mean = paired_ci(deltas)
-    base_mean = statistics.fmean(b_vals) or 1e-9
-    pct = mean / base_mean * 100
-    accepted = lo > 0
-    reason = "CI-separated improvement" if accepted else "improvement not distinguishable from noise"
+    base_mean = statistics.fmean(b_vals) if b_vals else 0.0
+    pct = improvement_pct(mean, base_mean)
+    separated = lo > 0
+    # No baseline to be a fraction of means the effect size cannot be relative; a
+    # candidate serving anything at all where the baseline served nothing is as large an
+    # effect as there is.
+    material = base_mean <= 0 or mean >= MIN_EFFECT_FRAC * base_mean
+    accepted = separated and material and not errors
+    if errors:
+        # A repeat that failed scored 0.0, which drags its arm's mean down and makes the
+        # delta look bigger and better separated. The interval is measuring the failure,
+        # not the config, so it cannot be allowed to carry the verdict.
+        reason = f"repeat failed: {'; '.join(errors)}"
+    elif not separated:
+        reason = "improvement not distinguishable from noise"
+    elif not material:
+        reason = f"improvement {pct:.2f}% is below the {MIN_EFFECT_FRAC:.0%} minimum effect size"
+    else:
+        reason = "CI-separated improvement"
     quality: QualityScore | None = None
-    if accepted and needs_quality_guard(baseline.candidate.config.knobs, candidate.candidate.config.knobs):
+    if accepted and needs_quality_guard(
+        baseline.candidate.config.knobs, candidate.candidate.config.knobs
+    ):
         quality = guard.evaluate(candidate.candidate.config, ctx)
         if quality.recovery < recovery_threshold(candidate.candidate.config):
             accepted, reason = False, f"quality recovery {quality.recovery:.3f} below threshold"
-    return VerifyResult(accepted=accepted, repeats=repeats, load_point=c, baseline_goodput=b_vals, candidate_goodput=c_vals,
-                        delta_mean=mean, ci_low=lo, ci_high=hi, improvement_pct=pct, quality=quality, reason=reason)
+    return VerifyResult(
+        accepted=accepted,
+        repeats=repeats,
+        load_point=c,
+        baseline_goodput=b_vals,
+        candidate_goodput=c_vals,
+        baseline_mean=base_mean,
+        comparable=base_mean > 0,
+        delta_mean=mean,
+        ci_low=lo,
+        ci_high=hi,
+        improvement_pct=pct,
+        quality=quality,
+        reason=reason,
+        errors=errors,
+    )
 ```
 
 - [ ] **Step 4: Run tests and lint**
@@ -5621,50 +6218,125 @@ Also change `on_trial: object | None` to `on_trial: Callable[[Trial], None] | No
 
 `src/infervolt/diagnose/ranker.py`:
 ```python
-"""LLM ranks and explains rule findings; falls back to rule order if it fails or hallucinates."""
+"""LLM ranks and explains the rule findings, with the rule order as the fallback.
+
+The rules decide *what fired*; the model only decides which of the things that fired
+matters most and says why. That split is what keeps a hallucination cheap: a reply
+naming a rule id the context never contained is discarded and the deterministic order
+stands, so the worst an unavailable or confused model can do is cost the run its
+narrative -- never its diagnosis.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from infervolt.core.types import Diagnosis, Finding, KnobValue, Observation, RunContext
-from infervolt.llm.base import SYSTEM_PROMPT, DiagnosisOut, LLMClient, LLMError, render_prompt
+from infervolt.llm.base import SYSTEM_PROMPT, DiagnosisOut, LLMClient, render_prompt
+
+ATTEMPTS = 2
+"""Tries given to the model before falling back. A schema-valid but hallucinating reply
+is usually a sampling accident, and a second draw is cheaper than losing the rationale."""
+
+FALLBACK_CAVEAT = "LLM ranking unavailable or invalid; using rule order"
 
 
-def rank(llm: LLMClient, findings: list[Finding], ctx: RunContext, obs: list[Observation], knobs: dict[str, KnobValue]) -> Diagnosis:
+def rank(
+    llm: LLMClient,
+    findings: list[Finding],
+    ctx: RunContext,
+    obs: list[Observation],
+    knobs: dict[str, KnobValue],
+    log: Callable[[str], None] = lambda _: None,
+) -> Diagnosis:
+    """Turn scored findings into a diagnosis, asking ``llm`` to rank and explain them."""
     if not findings:
-        return Diagnosis(primary="under_loaded", ranked=[], rationale="No rule fired; the server was not saturated.", confidence=0.0, subspaces=[])
+        return Diagnosis(
+            primary="under_loaded",
+            ranked=[],
+            rationale="No rule fired; the server was not saturated.",
+            confidence=0.0,
+            subspaces=[],
+        )
     context: dict[str, Any] = {
         "findings": [f.model_dump() for f in findings],
-        "workload": ctx.workload.model_dump(), "slo": ctx.slo.model_dump(),
-        "hardware": ctx.hw.model_dump(), "model": ctx.model.model_dump(), "config": knobs,
-        "metrics": [{"concurrency": o.load_point, "valid": o.valid, **o.metrics.model_dump(), "engine": o.engine, "gpu": o.gpu} for o in obs],
+        "workload": ctx.workload.model_dump(),
+        "slo": ctx.slo.model_dump(),
+        "hardware": ctx.hw.model_dump(),
+        "model": ctx.model.model_dump(),
+        "config": knobs,
+        "metrics": [
+            {
+                "concurrency": o.load_point,
+                "valid": o.valid,
+                **o.metrics.model_dump(),
+                "engine": o.engine,
+                "gpu": o.gpu,
+            }
+            for o in obs
+        ],
     }
     ids = {f.rule_id for f in findings}
     out: DiagnosisOut | None = None
-    for _ in range(2):
+    for _ in range(ATTEMPTS):
         try:
-            cand = llm.structured(system=SYSTEM_PROMPT, user=render_prompt("rank", context), schema=DiagnosisOut)
-        except LLMError:
+            cand = llm.structured(
+                system=SYSTEM_PROMPT, user=render_prompt("rank", context), schema=DiagnosisOut
+            )
+        except Exception as e:  # noqa: BLE001 - any client failure falls back to rule order
+            # Not just LLMError: a missing API key, a typo'd base URL or an SDK that
+            # changed its exception hierarchy are all "no ranking today", and the
+            # deterministic order underneath is a complete answer on its own.
+            log(f"rank: llm error: {type(e).__name__}: {e}")
             continue
+        # The model may only rank rules it was shown. Anything else is a hallucination,
+        # however confident, and the whole reply goes with it.
         if cand.primary_rule_id in ids and set(cand.ranked_rule_ids) <= ids:
             out = cand
             break
     by_id = {f.rule_id: f for f in findings}
     if out is None:
-        primary = findings[0]
-        return Diagnosis(primary=primary.bottleneck, ranked=findings, rationale=primary.summary, confidence=primary.score,
-                         subspaces=primary.subspaces, caveats=["LLM ranking unavailable or invalid; using rule order"])
-    ranked = [by_id[r] for r in out.ranked_rule_ids] + [f for f in findings if f.rule_id not in out.ranked_rule_ids]
+        top = findings[0]
+        return Diagnosis(
+            primary=top.bottleneck,
+            ranked=findings,
+            rationale=top.summary,
+            confidence=top.score,
+            subspaces=top.subspaces,
+            caveats=[FALLBACK_CAVEAT],
+        )
+    # A partial ranking is honoured for the part it covers; findings the model left out
+    # keep their rule order behind it rather than disappearing from the report. A repeated
+    # id is listed once -- the report is a ranking, not a transcript of the reply.
+    listed: list[str] = []
+    for rule_id in out.ranked_rule_ids:
+        if rule_id not in listed:
+            listed.append(rule_id)
+    ranked = [by_id[r] for r in listed]
+    ranked += [f for f in findings if f.rule_id not in listed]
     primary = by_id[out.primary_rule_id]
-    return Diagnosis(primary=primary.bottleneck, ranked=ranked, rationale=out.rationale, confidence=out.confidence,
-                     subspaces=primary.subspaces, caveats=out.caveats)
+    return Diagnosis(
+        primary=primary.bottleneck,
+        ranked=ranked,
+        rationale=out.rationale,
+        confidence=out.confidence,
+        subspaces=primary.subspaces,
+        caveats=out.caveats,
+    )
 ```
 
 `src/infervolt/agent/__init__.py`: empty.
 
 `src/infervolt/agent/budget.py`:
 ```python
+"""What the run is allowed to spend, and whether it has spent it.
+
+The tracker is advisory rather than enforcing: it converts a :class:`Budget` into an
+absolute deadline the search can stop before crossing, and answers "is there anything
+left" for the caller's own checks. Nothing here cancels work already in flight.
+"""
+
 from __future__ import annotations
 
 import time
@@ -5673,6 +6345,8 @@ from infervolt.core.types import Budget
 
 
 class BudgetTracker:
+    """Wall-clock, cost and trial counters for one run."""
+
     def __init__(self, budget: Budget) -> None:
         self.budget = budget
         self.start = time.time()
@@ -5681,18 +6355,28 @@ class BudgetTracker:
 
     @property
     def deadline(self) -> float:
+        """Absolute ``time.time()`` after which no new trial may start."""
         return self.start + self.budget.max_wall_s
 
     def charge(self, usd: float) -> None:
         self.spent_usd += usd
         self.trials += 1
 
-    def exhausted(self) -> str | None:
+    def exhausted(self, *, count_trials: bool = True) -> str | None:
+        """Why the budget is spent, or ``None`` while it is not.
+
+        ``count_trials=False`` asks only about the resources a run can still *waste*.
+        Spending every trial is what the search is for, so a caller deciding whether the
+        verification it already earned may go ahead asks without the trial counter --
+        wall-clock and money are gone whether or not the work was worth it, but a search
+        that used its whole trial budget is a search that finished.
+        """
         if time.time() > self.deadline:
             return "wall-clock budget exhausted"
+        # ``max_usd`` of 0 means unlimited, which is also what an untracked engine reports.
         if self.budget.max_usd and self.spent_usd > self.budget.max_usd:
             return f"cost budget exhausted (${self.spent_usd:.2f})"
-        if self.trials >= self.budget.max_trials:
+        if count_trials and self.trials >= self.budget.max_trials:
             return "trial budget exhausted"
         return None
 ```
@@ -5701,12 +6385,20 @@ class BudgetTracker:
 ```python
 """The optimize loop as an explicit state machine with ledger checkpoints.
 
-PREPARE -> BASELINE -> DIAGNOSE -> PLAN -> SEARCH -> VERIFY -> EMIT -> LEARN -> DONE
+``prepare -> baseline -> diagnose -> plan -> search -> verify -> emit -> learn -> done``
+
+Every transition is written to the ledger before the work it names, so a run that dies
+leaves a row saying what it was doing. Two of the states can end the run early without
+failing it: a diagnosis with nothing tunable in it, and a search or verification that
+found no win. Both are legitimate answers -- "nothing to change here" is a result -- and
+both produce a report rather than a recipe.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import math
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -5716,19 +6408,52 @@ from infervolt import __version__
 from infervolt.agent.budget import BudgetTracker
 from infervolt.config import Settings
 from infervolt.core.types import (
-    Candidate, Diagnosis, EngineConfig, KnobSpace, KnobValue, OptimizeSpec, RunContext, RunOutcome, SearchPlan, Trial,
+    Candidate,
+    Diagnosis,
+    EngineConfig,
+    Evidence,
+    KnobSpace,
+    KnobValue,
+    OptimizeSpec,
+    RunContext,
+    RunOutcome,
+    RunState,
+    SearchPlan,
+    Trial,
+    TrialStatus,
 )
 from infervolt.diagnose.ranker import rank
 from infervolt.diagnose.rules import evaluate_rules
 from infervolt.engines.base import EngineAdapter
 from infervolt.engines.registry import get_adapter
 from infervolt.hardware.profiles import get_profile
-from infervolt.llm.base import SYSTEM_PROMPT, LLMClient, LLMError, NarrativeOut, SearchPlanOut, prompts_sha, render_prompt
+from infervolt.llm.base import (
+    SYSTEM_PROMPT,
+    LLMClient,
+    NarrativeOut,
+    SearchPlanOut,
+    prompts_sha,
+    render_prompt,
+)
 from infervolt.models.catalog import get_model_info
 from infervolt.recipes.emit import write_recipe, write_report
 from infervolt.recipes.schema import (
-    Recipe, RecipeDiagnosis, RecipeDist, RecipeEngine, RecipeFinding, RecipeHardware, RecipeInfervolt, RecipeMeasured,
-    RecipeModel, RecipeProvenance, RecipeQuality, RecipeResult, RecipeSearch, RecipeServe, RecipeSLO, RecipeWorkload,
+    Recipe,
+    RecipeDiagnosis,
+    RecipeDist,
+    RecipeEngine,
+    RecipeFinding,
+    RecipeHardware,
+    RecipeInfervolt,
+    RecipeMeasured,
+    RecipeModel,
+    RecipeProvenance,
+    RecipeQuality,
+    RecipeResult,
+    RecipeSearch,
+    RecipeServe,
+    RecipeSLO,
+    RecipeWorkload,
 )
 from infervolt.runner.trial import run_candidate
 from infervolt.search.optuna_search import STAGE2_REQUESTS, run_search
@@ -5738,24 +6463,67 @@ from infervolt.verify.quality import MockQualityGuard, QualityGuard
 from infervolt.verify.verify import VerifyResult, verify
 from infervolt.workloads.presets import get_workload
 
-REPORT_METRICS = ["goodput_rps", "goodput_frac", "req_per_s", "output_tps", "ttft_p90_ms", "itl_p90_ms", "usd_per_m_tokens"]
+REPORT_METRICS = [
+    "goodput_rps",
+    "goodput_frac",
+    "req_per_s",
+    "output_tps",
+    "ttft_p90_ms",
+    "itl_p90_ms",
+    "usd_per_m_tokens",
+]
+"""The metrics a recipe reports before and after. Deliberately short: throughput under
+the SLO, the raw rates behind it, the two latencies the SLO is written in, and cost."""
+
+MAX_PRIORS = 4
+"""Prior candidates accepted from the planning call. Enough for the model to express a
+hypothesis and a couple of variants, few enough that TPE still gets most of the budget."""
+
+TARGET_FRACTION = 0.95
+"""Share of the final best objective that counts as "reached the target", for
+``trials_to_target``."""
+
+INFEASIBLE_STATUSES: tuple[TrialStatus, ...] = ("infeasible_oom", "crash", "rejected", "timeout")
+"""Trial outcomes the recipe counts as "the config could not be measured".
+
+A ``timeout`` belongs here with the OOMs and the crashes: a server that never came up, or
+a load point that never finished, produced no objective, and counting it as a candidate
+that merely lost would understate how much of the space this hardware refuses."""
 
 
 class Planner:
-    def __init__(self, spec: OptimizeSpec, settings: Settings, llm: LLMClient, ledger: Ledger,
-                 adapter: EngineAdapter | None = None, guard: QualityGuard | None = None,
-                 log: Callable[[str], None] = print) -> None:
-        self.spec, self.settings, self.llm, self.ledger, self.log = spec, settings, llm, ledger, log
+    """Runs one optimization from spec to recipe."""
+
+    def __init__(
+        self,
+        spec: OptimizeSpec,
+        settings: Settings,
+        llm: LLMClient,
+        ledger: Ledger,
+        adapter: EngineAdapter | None = None,
+        guard: QualityGuard | None = None,
+        log: Callable[[str], None] = print,
+    ) -> None:
+        self.spec = spec
+        self.settings = settings
+        self.llm = llm
+        self.ledger = ledger
+        self.log = log
         self.adapter = adapter or get_adapter(spec.engine)
         self.guard = guard or MockQualityGuard()
 
     # ---- entry point
     def run(self) -> RunOutcome:
+        """Run the loop. Always returns; never raises."""
         run_id = self.ledger.create_run(self.spec)
         try:
             return self._run(run_id)
         except Exception as e:  # noqa: BLE001 - the run must always end in a terminal state
-            self.ledger.set_state(run_id, "failed")
+            # The ledger write is itself best-effort: a failing database must not replace
+            # the exception that actually ended the run with one about bookkeeping.
+            with contextlib.suppress(Exception):
+                self.ledger.set_state(run_id, "failed")
+            self.log(f"failed: {type(e).__name__}: {e}")
             return RunOutcome(run_id=run_id, state="failed", message=f"{type(e).__name__}: {e}")
 
     def _run(self, run_id: str) -> RunOutcome:
@@ -5764,41 +6532,90 @@ class Planner:
         tracker = BudgetTracker(self.spec.budget)
         self.log(f"run: {run_id}")
 
+        if errs := _baseline_errors(self.spec.baseline, space):
+            return self._fail(run_id, f"invalid --baseline: {'; '.join(errs)}")
+
         self._state(run_id, "baseline")
         baseline = self._baseline(ctx, space)
         if baseline.status != "ok" or baseline.result is None:
-            return self._fail(run_id, f"baseline failed: {baseline.status} {baseline.log_tail[:200]}")
-        self.log(f"baseline goodput {baseline.result.objective:.3f} rps at c={baseline.result.best_load_point}")
+            return self._fail(
+                run_id, f"baseline failed: {baseline.status} {baseline.log_tail[:200]}"
+            )
+        self.log(
+            f"baseline goodput {baseline.result.objective:.3f} rps "
+            f"at c={baseline.result.best_load_point}"
+        )
 
         self._state(run_id, "diagnose")
-        findings = evaluate_rules(baseline.result.observations, ctx, baseline.candidate.config, space)
-        diagnosis = rank(self.llm, findings, ctx, baseline.result.observations, baseline.candidate.config.knobs)
+        findings = evaluate_rules(
+            baseline.result.observations, ctx, baseline.candidate.config, space
+        )
+        diagnosis = rank(
+            self.llm,
+            findings,
+            ctx,
+            baseline.result.observations,
+            baseline.candidate.config.knobs,
+            log=self.log,
+        )
         self.ledger.set_diagnosis(run_id, diagnosis.model_dump_json())
-        self.log(f"primary bottleneck: {diagnosis.primary} (confidence {diagnosis.confidence:.2f}); findings: "
-                 + ", ".join(f"{f.rule_id}={f.score:.2f}" for f in diagnosis.ranked))
+        self.log(
+            f"primary bottleneck: {diagnosis.primary} (confidence {diagnosis.confidence:.2f}); "
+            "findings: " + ", ".join(f"{f.rule_id}={f.score:.2f}" for f in diagnosis.ranked)
+        )
         if diagnosis.primary in ("client_artifact", "under_loaded") or not diagnosis.subspaces:
-            return self._finish_without_change(run_id, ctx, baseline, diagnosis, "no tunable bottleneck identified")
+            return self._finish_without_change(
+                run_id, ctx, baseline, diagnosis, "no tunable bottleneck identified"
+            )
 
         self._state(run_id, "plan")
         plan = self._plan(ctx, space, diagnosis, baseline.candidate.config)
-        self.log(f"search plan: subspaces={plan.subspaces} priors={len(plan.priors)} max_trials={plan.max_trials}")
+        self.log(
+            f"search plan: subspaces={plan.subspaces} priors={len(plan.priors)} "
+            f"max_trials={plan.max_trials}"
+        )
 
         self._state(run_id, "search")
-        trials = run_search(self.adapter, ctx, space, plan, baseline, self.ledger, self.spec.budget, self.spec.seed,
-                            deadline=tracker.deadline, on_trial=lambda t: self._on_trial(t, tracker))
+        trials = run_search(
+            self.adapter,
+            ctx,
+            space,
+            plan,
+            baseline,
+            self.ledger,
+            self.spec.budget,
+            self.spec.seed,
+            deadline=tracker.deadline,
+            on_trial=lambda t: self._on_trial(t, tracker),
+        )
         ok = [t for t in trials if t.status == "ok" and t.result is not None]
         if not ok:
-            return self._finish_without_change(run_id, ctx, baseline, diagnosis, "no feasible candidate improved on baseline")
-        best = max(ok, key=lambda t: t.result.objective)  # type: ignore[union-attr]
-        assert best.result is not None
-        if best.result.objective <= baseline.result.objective:
-            return self._finish_without_change(run_id, ctx, baseline, diagnosis, "search found nothing better than baseline")
+            return self._finish_without_change(
+                run_id, ctx, baseline, diagnosis, "no feasible candidate improved on baseline"
+            )
+        best = max(ok, key=_objective)
+        if best.result is None or best.result.objective <= baseline.result.objective:
+            return self._finish_without_change(
+                run_id, ctx, baseline, diagnosis, "search found nothing better than baseline"
+            )
+        # Verification is several more launches -- the most expensive stage in the loop --
+        # so the budget is re-checked here rather than only inside the search. The trial
+        # counter is deliberately not consulted: a search that spent every trial did its
+        # job, and refusing to verify its winner would throw the run away at the end.
+        if why := tracker.exhausted(count_trials=False):
+            return self._finish_without_change(
+                run_id, ctx, baseline, diagnosis, f"stopped before verification: {why}"
+            )
 
         self._state(run_id, "verify")
         v = verify(self.adapter, ctx, baseline, best, self.guard)
-        self.log(f"verify: {'ACCEPTED' if v.accepted else 'rejected'} {v.improvement_pct:+.1f}% (CI {v.ci_low:.3f}..{v.ci_high:.3f}) {v.reason}")
+        self.log(
+            f"verify: {'ACCEPTED' if v.accepted else 'rejected'} {_improvement_text(v)} {v.reason}"
+        )
         if not v.accepted:
-            return self._finish_without_change(run_id, ctx, baseline, diagnosis, f"verify rejected best trial: {v.reason}")
+            return self._finish_without_change(
+                run_id, ctx, baseline, diagnosis, f"verify rejected best trial: {v.reason}"
+            )
         self.ledger.set_best(run_id, best.id)
 
         self._state(run_id, "emit")
@@ -5808,123 +6625,345 @@ class Planner:
         self.ledger.set_recipe(run_id, str(recipe_path))
         self.log(f"recipe: {recipe_path}\nreport: {report_path}")
 
+        # M4: this is where a run's insights are folded into cross-run memory.
         self._state(run_id, "learn")
         ttt = trials_to_target(trials, best.result.objective)
         self._state(run_id, "done")
-        return RunOutcome(run_id=run_id, state="done", baseline_trial_id=baseline.id, best_trial_id=best.id, diagnosis=diagnosis,
-                          recipe_path=str(recipe_path), report_path=str(report_path), trials_to_target=ttt,
-                          improvement_pct=v.improvement_pct, accepted=True, message="ok")
+        return RunOutcome(
+            run_id=run_id,
+            state="done",
+            baseline_trial_id=baseline.id,
+            best_trial_id=best.id,
+            diagnosis=diagnosis,
+            recipe_path=str(recipe_path),
+            report_path=str(report_path),
+            trials_to_target=ttt,
+            improvement_pct=v.improvement_pct,
+            accepted=True,
+            message="ok",
+        )
 
     # ---- states
     def _prepare(self, run_id: str) -> RunContext:
         if self.spec.hardware == "auto":
             raise ValueError("hardware auto-detection arrives in M2; pass --hardware <profile>")
-        return RunContext(run_id=run_id, run_dir=str(self.ledger.run_dir(run_id)), hw=get_profile(self.spec.hardware),
-                          model=get_model_info(self.spec.model), workload=get_workload(self.spec.workload), slo=self.spec.slo, seed=self.spec.seed)
+        return RunContext(
+            run_id=run_id,
+            run_dir=str(self.ledger.run_dir(run_id)),
+            hw=get_profile(self.spec.hardware),
+            model=get_model_info(self.spec.model),
+            workload=get_workload(self.spec.workload),
+            slo=self.spec.slo,
+            seed=self.spec.seed,
+        )
 
     def _baseline(self, ctx: RunContext, space: KnobSpace) -> Trial:
-        cfg = EngineConfig(engine=self.spec.engine, knobs={**space.defaults(), **self.spec.baseline})
-        trial = Trial(id="t0", run_id=ctx.run_id, index=0, candidate=Candidate(id="c0", config=cfg, origin="baseline"), stage=2)
-        trial = run_candidate(self.adapter, trial, ctx, ctx.workload.load.concurrency, STAGE2_REQUESTS)
+        """Measure the config the user is running today, as a full sweep."""
+        cfg = EngineConfig(
+            engine=self.spec.engine, knobs={**space.defaults(), **self.spec.baseline}
+        )
+        trial = Trial(
+            id="t0",
+            run_id=ctx.run_id,
+            index=0,
+            candidate=Candidate(id="c0", config=cfg, origin="baseline"),
+            stage=2,
+        )
+        trial = run_candidate(
+            self.adapter, trial, ctx, ctx.workload.load.concurrency, STAGE2_REQUESTS
+        )
         self.ledger.save_trial(trial)
         return trial
 
-    def _plan(self, ctx: RunContext, space: KnobSpace, diagnosis: Diagnosis, base_cfg: EngineConfig) -> SearchPlan:
+    def _plan(
+        self, ctx: RunContext, space: KnobSpace, diagnosis: Diagnosis, base_cfg: EngineConfig
+    ) -> SearchPlan:
+        """Ask the model which sub-space to search and what to try first.
+
+        Everything it proposes is filtered against what actually exists: sub-spaces it
+        did not invent, knobs the engine offers, values inside the knob's own range, and
+        finally the adapter's static validation on this hardware. A plan that survives
+        none of that degrades to the diagnosis's own sub-spaces with no priors.
+        """
         context: dict[str, Any] = {
-            "diagnosis": diagnosis.model_dump(), "knob_space": [k.model_dump() for k in space.knobs], "current": base_cfg.knobs,
-            "budget": self.spec.budget.model_dump(), "priors": [], "notes": [], "hardware": ctx.hw.model_dump(), "workload": ctx.workload.model_dump(),
+            "diagnosis": diagnosis.model_dump(),
+            "knob_space": [k.model_dump() for k in space.knobs],
+            "current": base_cfg.knobs,
+            "budget": self.spec.budget.model_dump(),
+            "priors": [],
+            "notes": [],
+            "hardware": ctx.hw.model_dump(),
+            "workload": ctx.workload.model_dump(),
         }
         try:
-            out = self.llm.structured(system=SYSTEM_PROMPT, user=render_prompt("plan", context), schema=SearchPlanOut)
-        except LLMError as e:
-            self.log(f"plan: LLM failed ({e}); searching the diagnosis sub-spaces without priors")
-            out = SearchPlanOut(subspaces=diagnosis.subspaces, max_trials=self.spec.budget.max_trials)
+            out = self.llm.structured(
+                system=SYSTEM_PROMPT, user=render_prompt("plan", context), schema=SearchPlanOut
+            )
+        except Exception as e:  # noqa: BLE001 - any client failure degrades to no priors
+            self.log(
+                f"plan: llm error: {type(e).__name__}: {e}; "
+                "searching the diagnosis sub-spaces without priors"
+            )
+            out = SearchPlanOut(
+                subspaces=diagnosis.subspaces, max_trials=self.spec.budget.max_trials
+            )
         groups = set(space.groups())
         subspaces = [g for g in out.subspaces if g in groups] or diagnosis.subspaces
         names = set(space.names())
         bounds = Bounds(space)
         priors: list[Candidate] = []
-        for i, p in enumerate(out.priors[:4]):
+        for i, p in enumerate(out.priors[:MAX_PRIORS]):
             unknown = set(p.knobs) - names
             if unknown:
                 self.log(f"plan: dropping unknown knobs {sorted(unknown)} from prior {i}")
             knobs = clamp({k: v for k, v in p.knobs.items() if k in names}, space, bounds)
-            knobs = {k: v for k, v in knobs.items() if _in_choices(space, k, v)}
+            off_menu = {k: v for k, v in knobs.items() if not _in_choices(space, k, v)}
+            if off_menu:
+                # Clamping cannot rescue a categorical: there is no nearest legal value to
+                # move to, only a list the value is not on. Say so rather than dropping it
+                # silently, so a plan that half survived does not read like one that fit.
+                self.log(f"plan: dropping out-of-choices knobs {off_menu} from prior {i}")
+            knobs = {k: v for k, v in knobs.items() if k not in off_menu}
             if not knobs:
                 continue
             cfg = base_cfg.with_knobs(**knobs)
             if errs := self.adapter.validate(cfg, ctx):
                 self.log(f"plan: prior {i} rejected statically: {errs}")
                 continue
-            priors.append(Candidate(id=f"p{i}", config=cfg, origin="llm_prior", hypothesis=p.hypothesis, parent_id="c0"))
-        return SearchPlan(subspaces=subspaces, priors=priors, max_trials=max(1, min(out.max_trials, self.spec.budget.max_trials)), rationale=out.rationale)
+            priors.append(
+                Candidate(
+                    id=f"p{i}",
+                    config=cfg,
+                    origin="llm_prior",
+                    hypothesis=p.hypothesis,
+                    parent_id="c0",
+                )
+            )
+        return SearchPlan(
+            subspaces=subspaces,
+            priors=priors,
+            max_trials=max(1, min(out.max_trials, self.spec.budget.max_trials)),
+            rationale=out.rationale,
+        )
 
     def _on_trial(self, t: Trial, tracker: BudgetTracker) -> None:
         tracker.charge(t.cost_usd)
         obj = f"{t.result.objective:.3f}" if t.result else "-"
-        self.log(f"trial {t.id} [{t.candidate.origin}] {t.status} stage={t.stage} objective={obj} {t.candidate.hypothesis}")
+        self.log(
+            f"trial {t.id} [{t.candidate.origin}] {t.status} stage={t.stage} "
+            f"objective={obj} {t.candidate.hypothesis}"
+        )
 
-    def _recipe(self, ctx: RunContext, space: KnobSpace, baseline: Trial, best: Trial, trials: list[Trial],
-                diagnosis: Diagnosis, plan: SearchPlan, v: VerifyResult) -> Recipe:
+    def _recipe(
+        self,
+        ctx: RunContext,
+        space: KnobSpace,
+        baseline: Trial,
+        best: Trial,
+        trials: list[Trial],
+        diagnosis: Diagnosis,
+        plan: SearchPlan,
+        v: VerifyResult,
+    ) -> Recipe:
         assert baseline.result is not None and best.result is not None
-        b_obs = next(o for o in baseline.result.observations if o.load_point == baseline.result.best_load_point)
-        c_obs = next(o for o in best.result.observations if o.load_point == best.result.best_load_point)
+        base_c = baseline.result.best_load_point
+        b_obs = next(o for o in baseline.result.observations if o.load_point == base_c)
+        c_obs = next(
+            o for o in best.result.observations if o.load_point == best.result.best_load_point
+        )
         b_metrics = {k: round(getattr(b_obs.metrics, k), 4) for k in REPORT_METRICS}
         c_metrics = {k: round(getattr(c_obs.metrics, k), 4) for k in REPORT_METRICS}
-        winning = {k: val for k, val in best.candidate.config.knobs.items() if baseline.candidate.config.knobs.get(k) != val}
-        narrative = self._narrative(diagnosis, b_metrics, c_metrics, winning, [t.id for t in trials])
+        winning = {
+            k: val
+            for k, val in best.candidate.config.knobs.items()
+            if baseline.candidate.config.knobs.get(k) != val
+        }
+        narrative = self._narrative(
+            diagnosis, b_metrics, c_metrics, winning, [t.id for t in trials]
+        )
         args, command = self.adapter.to_recipe_block(best.candidate.config, ctx)
         ver = self.adapter.version()
         w = ctx.workload
         return Recipe(
-            model=RecipeModel(id=ctx.model.id, params_b=ctx.model.params_b, arch=ctx.model.arch, moe=ctx.model.moe),
-            hardware=RecipeHardware(gpu=ctx.hw.gpu, count=ctx.hw.count, topology=ctx.hw.interconnect, provider=ctx.hw.name),
-            engine=RecipeEngine(name=ver.name, version=ver.version, image=ver.image_digest, commit=ver.commit),
-            workload=RecipeWorkload(name=w.name, isl=RecipeDist(p50=w.isl.p50, p99=w.isl.p99), osl=RecipeDist(p50=w.osl.p50, p99=w.osl.p99),
-                                    prefix_share=w.prefix_share, load={"mode": "sweep", "concurrency": w.load.concurrency}),
+            model=RecipeModel(
+                id=ctx.model.id, params_b=ctx.model.params_b, arch=ctx.model.arch, moe=ctx.model.moe
+            ),
+            hardware=RecipeHardware(
+                gpu=ctx.hw.gpu,
+                count=ctx.hw.count,
+                topology=ctx.hw.interconnect,
+                provider=ctx.hw.name,
+            ),
+            engine=RecipeEngine(
+                name=ver.name, version=ver.version, image=ver.image_digest, commit=ver.commit
+            ),
+            workload=RecipeWorkload(
+                name=w.name,
+                isl=RecipeDist(p50=w.isl.p50, p99=w.isl.p99),
+                osl=RecipeDist(p50=w.osl.p50, p99=w.osl.p99),
+                prefix_share=w.prefix_share,
+                load={"mode": "sweep", "concurrency": w.load.concurrency},
+            ),
             slo=RecipeSLO(**ctx.slo.model_dump()),
             serve=RecipeServe(args=args, command=command),
-            baseline=RecipeMeasured(serve_args=dict(baseline.candidate.config.knobs), metrics=b_metrics),
-            result=RecipeResult(metrics=c_metrics, repeats=v.repeats,
-                                improvement={"goodput_rps": f"{v.improvement_pct:+.0f}% (95% CI {v.ci_low:+.3f}..{v.ci_high:+.3f} rps at c={v.load_point})"},
-                                quality=RecipeQuality(**v.quality.model_dump()) if v.quality else None),
+            baseline=RecipeMeasured(
+                serve_args=dict(baseline.candidate.config.knobs),
+                metrics=b_metrics,
+                load_point=base_c,
+            ),
+            result=RecipeResult(
+                metrics=c_metrics,
+                load_point=best.result.best_load_point,
+                repeats=v.repeats,
+                improvement={"goodput_rps": _improvement_text(v)},
+                quality=RecipeQuality(**v.quality.model_dump()) if v.quality else None,
+            ),
             infervolt=RecipeInfervolt(
                 run_id=ctx.run_id,
-                diagnosis=RecipeDiagnosis(primary=diagnosis.primary, confidence=diagnosis.confidence,
-                                          findings=[RecipeFinding(rule=f.rule_id, score=f.score, evidence=f.evidence) for f in diagnosis.ranked]),
+                diagnosis=RecipeDiagnosis(
+                    primary=diagnosis.primary,
+                    confidence=diagnosis.confidence,
+                    findings=[
+                        RecipeFinding(
+                            rule=f.rule_id, score=f.score, evidence=[_round(e) for e in f.evidence]
+                        )
+                        for f in diagnosis.ranked
+                    ],
+                    caveats=diagnosis.caveats,
+                ),
                 rationale=narrative.rationale,
-                search=RecipeSearch(trials=len(trials), infeasible=sum(t.status in ("infeasible_oom", "crash", "rejected") for t in trials),
-                                    subspace=[k.name for k in space.subspace(plan.subspaces).knobs], optimizer="optuna-tpe", seed=self.spec.seed),
+                search=RecipeSearch(
+                    trials=len(trials),
+                    infeasible=sum(t.status in INFEASIBLE_STATUSES for t in trials),
+                    subspace=[k.name for k in space.subspace(plan.subspaces).knobs],
+                    optimizer="optuna-tpe",
+                    seed=self.spec.seed,
+                ),
                 trials_to_target=trials_to_target(trials, best.result.objective),
                 next_steps=narrative.next_steps,
                 artifacts={"report": "report.md", "trials": "trials.jsonl"},
-                provenance=RecipeProvenance(tool_version=__version__, llm=self.llm.model_id, prompts_sha=prompts_sha(),
-                                            created=datetime.now(UTC).strftime("%Y-%m-%d")),
+                provenance=RecipeProvenance(
+                    tool_version=__version__,
+                    llm=self.llm.model_id,
+                    prompts_sha=prompts_sha(),
+                    created=datetime.now(UTC).strftime("%Y-%m-%d"),
+                ),
             ),
         )
 
-    def _narrative(self, diagnosis: Diagnosis, b: dict[str, float], c: dict[str, float], winning: dict[str, KnobValue], trial_ids: list[str]) -> NarrativeOut:
-        context = {"diagnosis": diagnosis.model_dump(), "baseline_metrics": b, "best_metrics": c, "winning_knobs": winning, "trial_ids": trial_ids}
+    def _narrative(
+        self,
+        diagnosis: Diagnosis,
+        b: dict[str, float],
+        c: dict[str, float],
+        winning: dict[str, KnobValue],
+        trial_ids: list[str],
+    ) -> NarrativeOut:
+        context: dict[str, Any] = {
+            "diagnosis": diagnosis.model_dump(),
+            "baseline_metrics": b,
+            "best_metrics": c,
+            "winning_knobs": winning,
+            "trial_ids": trial_ids,
+        }
         try:
-            return self.llm.structured(system=SYSTEM_PROMPT, user=render_prompt("emit", context), schema=NarrativeOut)
-        except LLMError:
-            return NarrativeOut(rationale=f"{diagnosis.rationale} Winning knobs: {json.dumps(winning)}.", next_steps=["Re-run diagnosis on the tuned config."])
+            return self.llm.structured(
+                system=SYSTEM_PROMPT, user=render_prompt("emit", context), schema=NarrativeOut
+            )
+        except Exception as e:  # noqa: BLE001 - any client failure degrades to a template
+            # The measurements are the recipe; the prose is not. Losing the model here
+            # costs a sentence, not the run -- whatever the client failed with.
+            self.log(f"emit: llm error: {type(e).__name__}: {e}; using the template narrative")
+            return NarrativeOut(
+                rationale=f"{diagnosis.rationale} Winning knobs: {json.dumps(winning)}.",
+                next_steps=["Re-run diagnosis on the tuned config."],
+            )
 
-    def _finish_without_change(self, run_id: str, ctx: RunContext, baseline: Trial, diagnosis: Diagnosis, why: str) -> RunOutcome:
+    def _finish_without_change(
+        self, run_id: str, ctx: RunContext, baseline: Trial, diagnosis: Diagnosis, why: str
+    ) -> RunOutcome:
+        """End a run that measured and diagnosed but has nothing to recommend."""
         report = Path(ctx.run_dir) / "report.md"
-        report.write_text(f"# infervolt run {run_id}: no change recommended\n\n{why}\n\n"
-                          f"Primary bottleneck: {diagnosis.primary} (confidence {diagnosis.confidence:.2f})\n\n{diagnosis.rationale}\n")
+        report.write_text(
+            f"# infervolt run {run_id}: no change recommended\n\n{why}\n\n"
+            f"Primary bottleneck: {diagnosis.primary} (confidence {diagnosis.confidence:.2f})\n\n"
+            f"{diagnosis.rationale}\n"
+        )
         self._state(run_id, "done")
         self.log(f"no recipe: {why}\nreport: {report}")
-        return RunOutcome(run_id=run_id, state="done", baseline_trial_id=baseline.id, diagnosis=diagnosis, report_path=str(report), accepted=False, message=why)
+        return RunOutcome(
+            run_id=run_id,
+            state="done",
+            baseline_trial_id=baseline.id,
+            diagnosis=diagnosis,
+            report_path=str(report),
+            accepted=False,
+            message=why,
+        )
 
     def _fail(self, run_id: str, msg: str) -> RunOutcome:
         self._state(run_id, "failed")
         self.log(f"failed: {msg}")
         return RunOutcome(run_id=run_id, state="failed", message=msg)
 
-    def _state(self, run_id: str, state: str) -> None:
-        self.ledger.set_state(run_id, state)  # type: ignore[arg-type]
+    def _state(self, run_id: str, state: RunState) -> None:
+        self.ledger.set_state(run_id, state)
+
+
+def _round(e: Evidence) -> Evidence:
+    """One evidence value at four significant digits.
+
+    Rules compute in floating point, so a ratio lands as ``1.9999999999999998`` as often
+    as ``2.0``; four significant digits is more precision than any of these numbers earn
+    and stops the recipe from implying otherwise. Significant digits rather than decimal
+    places because the values span ``0.0001234`` (a fraction) to ``123400`` (a token rate).
+    """
+    return e.model_copy(update={"value": float(f"{e.value:.4g}")})
+
+
+def _baseline_errors(baseline: dict[str, KnobValue], space: KnobSpace) -> list[str]:
+    """Everything wrong with ``--baseline`` overrides, checked before anything is launched.
+
+    A typo'd knob name is silently harmless today -- it lands in the config dict, the
+    adapter ignores it, and the run measures the default instead while reporting the
+    override. That is worse than failing: the recipe then answers a question nobody asked.
+    """
+    errors: list[str] = []
+    names = space.names()
+    for name, value in baseline.items():
+        if name not in names:
+            errors.append(f"unknown knob {name!r}; known knobs: {', '.join(sorted(names))}")
+            continue
+        knob = space.get(name)
+        if knob.kind == "cat" and value not in knob.choices:
+            errors.append(f"{name}={value!r} is not one of {knob.choices!r}")
+    return errors
+
+
+def _improvement_text(v: VerifyResult) -> str:
+    """The headline win, as a percentage when the baseline had a rate to compare against.
+
+    ``VerifyResult.comparable`` is verify's own answer to "was there a baseline rate to be
+    a percentage of", so it is taken rather than re-derived here; see its field docs for
+    why an arm can score zero. ``improvement_pct`` is infinite in exactly that case and is
+    checked too: "+inf%" is not a number to put in front of anyone.
+    """
+    ci = f"95% CI {v.ci_low:+.3f}..{v.ci_high:+.3f} rps at c={v.load_point}"
+    if math.isinf(v.improvement_pct) or not v.comparable:
+        return (
+            f"{v.delta_mean:+.3f} rps, from a baseline that served nothing "
+            f"at c={v.load_point} ({ci})"
+        )
+    return f"{v.improvement_pct:+.0f}% ({ci})"
+
+
+def _objective(trial: Trial) -> float:
+    """A trial's objective, and ``-inf`` for one that measured nothing.
+
+    Only ever used as a ``max`` key over trials already filtered to ``status == "ok"``
+    with a result, so the fallback is unreachable; it exists so the key function is total.
+    """
+    return trial.result.objective if trial.result is not None else float("-inf")
 
 
 def _in_choices(space: KnobSpace, name: str, value: KnobValue) -> bool:
@@ -5933,10 +6972,15 @@ def _in_choices(space: KnobSpace, name: str, value: KnobValue) -> bool:
 
 
 def trials_to_target(trials: list[Trial], final_best: float) -> int | None:
-    n = 0
-    for t in trials:
-        n += 1
-        if t.status == "ok" and t.result is not None and t.result.objective >= 0.95 * final_best:
+    """How many trials it took to get within :data:`TARGET_FRACTION` of the final best.
+
+    A cheap search-efficiency number for the recipe: the same win found in three trials
+    instead of twelve is the difference between a technique that is worth running and one
+    that is not.
+    """
+    target = TARGET_FRACTION * final_best
+    for n, t in enumerate(trials, start=1):
+        if t.status == "ok" and t.result is not None and t.result.objective >= target:
             return n
     return None
 ```
