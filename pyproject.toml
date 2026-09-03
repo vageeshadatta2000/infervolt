@@ -49,6 +49,7 @@ infervolt = "infervolt.cli.main:app"
 
 [project.entry-points."infervolt.engines"]
 mock = "infervolt.engines.mock.adapter:MockAdapter"
+vllm = "infervolt.engines.vllm.adapter:VllmAdapter"
 
 [build-system]
 requires = ["hatchling"]
