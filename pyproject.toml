@@ -29,10 +29,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/infervolt/infervolt"
-Repository = "https://github.com/infervolt/infervolt"
-Issues = "https://github.com/infervolt/infervolt/issues"
-Changelog = "https://github.com/infervolt/infervolt/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/vageeshadatta2000/infervolt"
+Repository = "https://github.com/vageeshadatta2000/infervolt"
+Issues = "https://github.com/vageeshadatta2000/infervolt/issues"
+Changelog = "https://github.com/vageeshadatta2000/infervolt/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [

@@ -3,12 +3,10 @@
 Thanks for helping. infervolt is pre-alpha; the fastest way to contribute is to run the mock loop,
 file issues with reproductions, and send small PRs.
 
-The canonical repository URL is set at first release; until then the clone URL below is a placeholder.
-
 ## Dev setup
 
 ```bash
-git clone https://github.com/infervolt/infervolt && cd infervolt
+git clone https://github.com/vageeshadatta2000/infervolt && cd infervolt
 uv sync --extra dev
 uv run pre-commit install
 uv run pytest -q
