@@ -75,7 +75,7 @@ from infervolt.runner.trial import run_candidate
 from infervolt.search.optuna_search import STAGE2_REQUESTS, run_search
 from infervolt.search.space import Bounds, clamp
 from infervolt.store.ledger import Ledger
-from infervolt.verify.quality import MockQualityGuard, QualityGuard
+from infervolt.verify.quality import QualityGuard, default_guard
 from infervolt.verify.verify import VerifyResult, verify
 from infervolt.workloads.presets import get_workload
 
@@ -126,7 +126,7 @@ class Planner:
         self.ledger = ledger
         self.log = log
         self.adapter = adapter or get_adapter(spec.engine)
-        self.guard = guard or MockQualityGuard()
+        self.guard = guard or default_guard(self.adapter, spec)
 
     # ---- entry point
     def run(self) -> RunOutcome:
