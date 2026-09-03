@@ -73,7 +73,8 @@ def run_sweep(
     total_s = 0.0
     best = 0.0
     for c in concurrencies:
-        o, dur = run_load_point(adapter, handle, ctx, c, num_requests)
+        # At least two requests per worker so high load points measure real contention.
+        o, dur = run_load_point(adapter, handle, ctx, c, max(num_requests, 2 * c))
         obs.append(o)
         total_s += dur
         if not o.valid or o.metrics.error_rate > SWEEP_ERROR_MAX:

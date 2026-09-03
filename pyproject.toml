@@ -26,6 +26,13 @@ dependencies = [
   "jinja2>=3.1",
   "anthropic>=1.0",
   "openai>=1.40",
+  "httpx>=0.27",
+  "gguf>=0.10",
+  "huggingface_hub>=0.25",
+  # Imported lazily, and only on a machine that has NVIDIA GPUs -- but it is a few
+  # hundred kilobytes of ctypes bindings, so there is nothing to gain from making the
+  # Linux path an extra the user has to remember to install.
+  "pynvml>=11",
 ]
 
 [project.urls]
@@ -49,6 +56,11 @@ infervolt = "infervolt.cli.main:app"
 
 [project.entry-points."infervolt.engines"]
 mock = "infervolt.engines.mock.adapter:MockAdapter"
+vllm = "infervolt.engines.vllm.adapter:VllmAdapter"
+
+[project.entry-points."infervolt.providers"]
+local = "infervolt.infra.local:LocalProvider"
+thunder = "infervolt.infra.thunder:ThunderProvider"
 
 [build-system]
 requires = ["hatchling"]

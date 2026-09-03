@@ -18,6 +18,10 @@ from pydantic import BaseModel
 
 from infervolt.core.types import OptimizeSpec, RunState, Trial
 
+# ``infra.types`` imports nothing internal, so persisting rented boxes here does not put
+# the ledger inside the provider import cycle.
+from infervolt.infra.types import Instance
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, created REAL NOT NULL, spec TEXT NOT NULL, state TEXT NOT NULL,
@@ -28,6 +32,11 @@ CREATE TABLE IF NOT EXISTS trials (
   FOREIGN KEY(run_id) REFERENCES runs(id)
 );
 CREATE INDEX IF NOT EXISTS trials_run ON trials(run_id, idx);
+CREATE TABLE IF NOT EXISTS instances (
+  id TEXT NOT NULL, provider TEXT NOT NULL, data TEXT NOT NULL, created REAL NOT NULL,
+  terminated REAL, PRIMARY KEY (provider, id)
+);
+CREATE INDEX IF NOT EXISTS instances_live ON instances(terminated);
 """
 
 
@@ -130,6 +139,56 @@ class Ledger:
                 "SELECT data FROM trials WHERE run_id=? ORDER BY idx, id", (run_id,)
             ).fetchall()
         return [Trial.model_validate_json(r[0]) for r in rows]
+
+    # ---- instances
+    def save_instance(self, instance: Instance) -> None:
+        """Write the row that lets a *different* process terminate this box.
+
+        That is the whole point of persisting it: a controller which crashes mid-run is
+        the case where a rented GPU bills all night, and the only thing that can stop it
+        is a row on disk naming the provider and the id. Re-saving an instance updates
+        the payload but keeps ``created`` -- and keeps ``terminated``, so a refresh after
+        teardown cannot resurrect a dead row into ``infra gc``.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO instances(id, provider, data, created, terminated) "
+                "VALUES (?,?,?,?,NULL) "
+                "ON CONFLICT(provider, id) DO UPDATE SET data=excluded.data",
+                (
+                    instance.id,
+                    instance.provider,
+                    instance.model_dump_json(),
+                    instance.created_at,
+                ),
+            )
+
+    def instances(self, active_only: bool = True, provider: str | None = None) -> list[Instance]:
+        sql = "SELECT data FROM instances"
+        clauses: list[str] = []
+        params: list[object] = []
+        if active_only:
+            clauses.append("terminated IS NULL")
+        if provider is not None:
+            clauses.append("provider=?")
+            params.append(provider)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [Instance.model_validate_json(r[0]) for r in rows]
+
+    def mark_terminated(self, instance_id: str, provider: str | None = None) -> None:
+        """Close the row. Silent about unknown ids: termination is called on paths that
+        must not raise, and "it is not in the ledger" is the state we wanted anyway."""
+        sql = "UPDATE instances SET terminated=? WHERE id=? AND terminated IS NULL"
+        params: list[object] = [time.time(), instance_id]
+        if provider is not None:
+            sql += " AND provider=?"
+            params.append(provider)
+        with self._lock, self._conn:
+            self._conn.execute(sql, params)
 
     # ---- artifacts
     def run_dir(self, run_id: str) -> Path:

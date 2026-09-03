@@ -90,13 +90,6 @@ def test_cli_rejects_an_unknown_llm(tmp_path: Path) -> None:
     assert all(name in res.output for name in LLM_NAMES)
 
 
-def test_cli_rejects_hardware_auto_until_detection_lands(tmp_path: Path) -> None:
-    """``auto`` is the default so M2 can switch it on; today it is the one illegal value."""
-    res = runner.invoke(app, ["optimize", "--model", "mock/qwen3-8b", "--home", str(tmp_path)])
-    assert res.exit_code == USAGE_ERROR, res.output
-    assert "M2" in res.output and "rtx4090-24" in res.output
-
-
 def test_cli_report_says_the_run_is_unknown(tmp_path: Path) -> None:
     res = runner.invoke(app, ["report", "no-such-run", "--home", str(tmp_path)])
     assert res.exit_code == 1
