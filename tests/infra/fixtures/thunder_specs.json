@@ -1,0 +1,499 @@
+{
+ "specs": {
+  "a100xl_x1": {
+   "displayName": "NVIDIA A100 (80GB)",
+   "gpuCount": 1,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    8,
+    12,
+    16
+   ],
+   "vramGB": 80
+  },
+  "a100xl_x1_production": {
+   "displayName": "NVIDIA A100 (80GB)",
+   "gpuCount": 1,
+   "mode": "production",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    15
+   ],
+   "vramGB": 80
+  },
+  "a100xl_x1_prototyping": {
+   "displayName": "NVIDIA A100 (80GB)",
+   "gpuCount": 1,
+   "mode": "prototyping",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    8,
+    12,
+    16
+   ],
+   "vramGB": 80
+  },
+  "a100xl_x2": {
+   "displayName": "NVIDIA A100 (80GB)",
+   "gpuCount": 2,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 1000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    16,
+    20,
+    24
+   ],
+   "vramGB": 80
+  },
+  "a100xl_x2_production": {
+   "displayName": "NVIDIA A100 (80GB)",
+   "gpuCount": 2,
+   "mode": "production",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 1000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    30
+   ],
+   "vramGB": 80
+  },
+  "a100xl_x2_prototyping": {
+   "displayName": "NVIDIA A100 (80GB)",
+   "gpuCount": 2,
+   "mode": "prototyping",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 1000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    16,
+    20,
+    24
+   ],
+   "vramGB": 80
+  },
+  "a100xl_x4": {
+   "displayName": "NVIDIA A100 (80GB)",
+   "gpuCount": 4,
+   "ramCapGiB": 420,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 2000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    36,
+    44,
+    52,
+    60
+   ],
+   "vramGB": 80
+  },
+  "a100xl_x4_production": {
+   "displayName": "NVIDIA A100 (80GB)",
+   "gpuCount": 4,
+   "mode": "production",
+   "ramCapGiB": 420,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 2000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    36,
+    44,
+    52,
+    60
+   ],
+   "vramGB": 80
+  },
+  "a100xl_x8": {
+   "displayName": "NVIDIA A100 (80GB)",
+   "gpuCount": 8,
+   "ramCapGiB": 840,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 4000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    96,
+    104,
+    112,
+    120
+   ],
+   "vramGB": 80
+  },
+  "a100xl_x8_production": {
+   "displayName": "NVIDIA A100 (80GB)",
+   "gpuCount": 8,
+   "mode": "production",
+   "ramCapGiB": 840,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 4000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    96,
+    104,
+    112,
+    120
+   ],
+   "vramGB": 80
+  },
+  "a6000_x1": {
+   "displayName": "RTX A6000",
+   "gpuCount": 1,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    6,
+    8
+   ],
+   "vramGB": 48
+  },
+  "a6000_x1_prototyping": {
+   "displayName": "RTX A6000",
+   "gpuCount": 1,
+   "mode": "prototyping",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    6,
+    8
+   ],
+   "vramGB": 48
+  },
+  "h100_x1": {
+   "displayName": "NVIDIA H100",
+   "gpuCount": 1,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "vramGB": 80
+  },
+  "h100_x1_production": {
+   "displayName": "NVIDIA H100",
+   "gpuCount": 1,
+   "mode": "production",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    15
+   ],
+   "vramGB": 80
+  },
+  "h100_x1_prototyping": {
+   "displayName": "NVIDIA H100",
+   "gpuCount": 1,
+   "mode": "prototyping",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "vramGB": 80
+  },
+  "h100_x2": {
+   "displayName": "NVIDIA H100",
+   "gpuCount": 2,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 1000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    8,
+    12,
+    16,
+    20,
+    24
+   ],
+   "vramGB": 80
+  },
+  "h100_x2_production": {
+   "displayName": "NVIDIA H100",
+   "gpuCount": 2,
+   "mode": "production",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 1000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    30
+   ],
+   "vramGB": 80
+  },
+  "h100_x2_prototyping": {
+   "displayName": "NVIDIA H100",
+   "gpuCount": 2,
+   "mode": "prototyping",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 1000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    8,
+    12,
+    16,
+    20,
+    24
+   ],
+   "vramGB": 80
+  },
+  "h100_x4": {
+   "displayName": "NVIDIA H100",
+   "gpuCount": 4,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 2000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    60
+   ],
+   "vramGB": 80
+  },
+  "h100_x4_production": {
+   "displayName": "NVIDIA H100",
+   "gpuCount": 4,
+   "mode": "production",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 2000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    60
+   ],
+   "vramGB": 80
+  },
+  "h100_x8": {
+   "displayName": "NVIDIA H100",
+   "gpuCount": 8,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 4000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    120
+   ],
+   "vramGB": 80
+  },
+  "h100_x8_production": {
+   "displayName": "NVIDIA H100",
+   "gpuCount": 8,
+   "mode": "production",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 4000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    120
+   ],
+   "vramGB": 80
+  },
+  "l40_x1": {
+   "displayName": "NVIDIA L40",
+   "gpuCount": 1,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    6,
+    8,
+    12
+   ],
+   "vramGB": 48
+  },
+  "l40_x1_production": {
+   "displayName": "NVIDIA L40",
+   "gpuCount": 1,
+   "mode": "production",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    10
+   ],
+   "vramGB": 48
+  },
+  "l40_x1_prototyping": {
+   "displayName": "NVIDIA L40",
+   "gpuCount": 1,
+   "mode": "prototyping",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 500,
+    "min": 100
+   },
+   "vcpuOptions": [
+    6,
+    8,
+    12
+   ],
+   "vramGB": 48
+  },
+  "l40_x2": {
+   "displayName": "NVIDIA L40",
+   "gpuCount": 2,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 1000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    12,
+    16,
+    20
+   ],
+   "vramGB": 48
+  },
+  "l40_x2_production": {
+   "displayName": "NVIDIA L40",
+   "gpuCount": 2,
+   "mode": "production",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 1000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    20
+   ],
+   "vramGB": 48
+  },
+  "l40_x2_prototyping": {
+   "displayName": "NVIDIA L40",
+   "gpuCount": 2,
+   "mode": "prototyping",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 1000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    12,
+    16,
+    20
+   ],
+   "vramGB": 48
+  },
+  "l40_x4": {
+   "displayName": "NVIDIA L40",
+   "gpuCount": 4,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 2000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    24,
+    32,
+    40
+   ],
+   "vramGB": 48
+  },
+  "l40_x4_production": {
+   "displayName": "NVIDIA L40",
+   "gpuCount": 4,
+   "mode": "production",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 2000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    24,
+    32,
+    40
+   ],
+   "vramGB": 48
+  },
+  "l40_x8": {
+   "displayName": "NVIDIA L40",
+   "gpuCount": 8,
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 4000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    48,
+    56,
+    64,
+    72,
+    80
+   ],
+   "vramGB": 48
+  },
+  "l40_x8_production": {
+   "displayName": "NVIDIA L40",
+   "gpuCount": 8,
+   "mode": "production",
+   "ramPerVCPUGiB": 8,
+   "storageGB": {
+    "max": 4000,
+    "min": 100
+   },
+   "vcpuOptions": [
+    48,
+    56,
+    64,
+    72,
+    80
+   ],
+   "vramGB": 48
+  }
+ }
+}

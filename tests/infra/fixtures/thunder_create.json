@@ -1,0 +1,6 @@
+{
+ "_comment": "Synthetic. Shape taken from thundertypes.InstanceCreateResponse in the published OpenAPI document; never captured live, because creating an instance costs money. The key material is a placeholder, not a key.",
+ "identifier": 42,
+ "key": "-----BEGIN OPENSSH PRIVATE KEY-----\nTHIS-IS-NOT-A-KEY-IT-IS-A-TEST-PLACEHOLDER\n-----END OPENSSH PRIVATE KEY-----\n",
+ "uuid": "00000000-0000-4000-8000-000000000042"
+}

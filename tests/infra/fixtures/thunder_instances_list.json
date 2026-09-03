@@ -1,0 +1,37 @@
+{
+ "_comment": "Synthetic. Field names and value shapes copied from a live GET /v1/instances/list (which returned {} -- no instances were running) and from thundertypes.InstanceListItem in the published OpenAPI document. The IP is TEST-NET-3 (RFC 5737) and the uuids are made up.",
+ "42": {
+  "cpuCores": "15",
+  "createdAt": "2026-09-02T10:00:00Z",
+  "gpuType": "a100xl",
+  "httpPorts": [
+   8000
+  ],
+  "ip": "203.0.113.10",
+  "memory": "120",
+  "name": "infervolt",
+  "numGpus": "1",
+  "port": 22,
+  "sshPublicKeys": [
+   "ssh-ed25519 AAAAPLACEHOLDER infervolt"
+  ],
+  "status": "RUNNING",
+  "storage": 100,
+  "template": "ubuntu-22.04",
+  "uuid": "00000000-0000-4000-8000-000000000042"
+ },
+ "43": {
+  "cpuCores": "8",
+  "createdAt": "2026-09-02T10:05:00Z",
+  "gpuType": "h100",
+  "httpPorts": [],
+  "ip": "",
+  "name": "infervolt",
+  "numGpus": "2",
+  "port": 0,
+  "status": "PENDING",
+  "storage": 100,
+  "template": "ubuntu-22.04",
+  "uuid": "00000000-0000-4000-8000-000000000043"
+ }
+}
