@@ -14,7 +14,6 @@ from infervolt.cli.infra import infra_app
 from infervolt.cli.remote import remote_app
 from infervolt.config import Settings
 from infervolt.core.types import Budget, KnobValue, OptimizeSpec
-from infervolt.hardware.profiles import PROFILES
 from infervolt.recipes.schema import Recipe
 from infervolt.workloads.presets import parse_slo
 
@@ -123,14 +122,6 @@ def optimize(
     if llm not in LLM_NAMES:
         raise typer.BadParameter(
             f"unknown llm {llm!r}; use {', '.join(LLM_NAMES)}", param_hint="--llm"
-        )
-    if hardware == "auto":
-        # The default is "auto" so that M2 can turn it on without changing anyone's
-        # command line; until then it is the one value the loop cannot serve, and saying
-        # so here is cheaper than a run that dies after opening a ledger row.
-        raise typer.BadParameter(
-            f"auto-detect arrives in M2; pass a profile name ({', '.join(sorted(PROFILES))})",
-            param_hint="--hardware",
         )
     settings = _settings(home)
     spec = OptimizeSpec(
