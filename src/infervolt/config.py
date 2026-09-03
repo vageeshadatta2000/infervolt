@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr = SecretStr("EMPTY")
     llm_cassette: Path | None = None
 
+    vllm_version: str = "0.11.0"
+    """Version installed on a rented box by ``remote optimize``, from ``INFERVOLT_VLLM_VERSION``.
+
+    A setting rather than a constant because the pin is the thing a real run changes: vLLM
+    ships every few weeks, a recipe is only reproducible against the version it was
+    measured on, and bumping it must not need a release of infervolt."""
+
     thunder_api_token: SecretStr | None = None
     """Thunder Compute REST token, from ``INFERVOLT_THUNDER_API_TOKEN``.
 

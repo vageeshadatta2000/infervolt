@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from infervolt import __version__
 from infervolt.cli.infra import infra_app
+from infervolt.cli.remote import remote_app
 from infervolt.config import Settings
 from infervolt.core.types import Budget, KnobValue, OptimizeSpec
 from infervolt.hardware.profiles import PROFILES
@@ -40,6 +41,7 @@ def main(
 recipe_app = typer.Typer(help="Recipe utilities.")
 app.add_typer(recipe_app, name="recipe")
 app.add_typer(infra_app, name="infra")
+app.add_typer(remote_app, name="remote")
 
 
 def _settings(home: Path | None) -> Settings:
