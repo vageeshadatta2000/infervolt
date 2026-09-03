@@ -6,6 +6,9 @@ Peak numbers are dense BF16 TFLOPs and HBM bandwidth from vendor specs.
 from __future__ import annotations
 
 from infervolt.core.types import HardwareProfile
+from infervolt.hardware.detect import detect_hardware
+
+AUTO = "auto"
 
 PROFILES: dict[str, HardwareProfile] = {
     "a100-80": HardwareProfile(
@@ -57,7 +60,13 @@ PROFILES: dict[str, HardwareProfile] = {
 
 
 def get_profile(name: str) -> HardwareProfile:
-    """Return a private copy, so callers can adapt a profile without editing the registry."""
+    """Return a private copy, so callers can adapt a profile without editing the registry.
+
+    ``"auto"`` is not a table entry: it asks the machine itself (NVML on Linux, sysctl on
+    Apple Silicon) and raises ``RuntimeError`` where it cannot be answered.
+    """
+    if name == AUTO:
+        return detect_hardware()
     try:
         return PROFILES[name].model_copy(deep=True)
     except KeyError as e:
