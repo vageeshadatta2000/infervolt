@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import anthropic
 import openai
 import pytest
+from pydantic import SecretStr
 
 from infervolt.config import Settings
 from infervolt.llm.anthropic_client import AnthropicClient
@@ -210,3 +211,47 @@ def test_factory(tmp_path: Path) -> None:
     assert isinstance(make_llm("fake", cassette), ReplayLLMClient)
     with pytest.raises(KeyError):
         make_llm("nope", s)
+
+
+def _capture_sdk(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Record the kwargs the lazy ``anthropic.Anthropic()`` construction is given."""
+    seen: dict[str, object] = {}
+
+    def build(**kw: object) -> _AnthropicStub:
+        seen.update(kw)
+        return _AnthropicStub()
+
+    monkeypatch.setattr("anthropic.Anthropic", build)
+    return seen
+
+
+def test_factory_passes_the_configured_anthropic_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``INFERVOLT_ANTHROPIC_API_KEY`` has to reach the SDK, or setting it does nothing."""
+    seen = _capture_sdk(monkeypatch)
+    settings = Settings(home=tmp_path, anthropic_api_key=SecretStr("sk-test"))
+    client = make_llm("anthropic", settings)
+    assert isinstance(client, AnthropicClient)
+    client.structured(system="s", user="u", schema=DiagnosisOut)
+    assert seen == {"api_key": "sk-test"}
+
+
+def test_factory_leaves_key_resolution_to_the_sdk_when_none_is_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unset means unset: the SDK still reads ``ANTHROPIC_API_KEY`` or a stored profile.
+
+    Passing ``api_key=""`` would be different -- it is a value, and it would override
+    whatever the environment had with an empty credential. A blank counts as unset
+    because .env.example ships the line with nothing after the ``=``.
+    """
+    for settings in (
+        Settings(home=tmp_path),
+        Settings(home=tmp_path, anthropic_api_key=SecretStr("")),
+    ):
+        seen = _capture_sdk(monkeypatch)
+        client = make_llm("anthropic", settings)
+        assert isinstance(client, AnthropicClient)
+        client.structured(system="s", user="u", schema=DiagnosisOut)
+        assert seen == {}

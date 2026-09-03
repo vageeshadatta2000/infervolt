@@ -170,6 +170,13 @@ def test_the_summary_table_labels_each_arms_load_point(tmp_path: Path) -> None:
     assert "(c=" in header
     assert f"Baseline (c={recipe.baseline.load_point})" in header
     assert f"Tuned (c={recipe.result.load_point})" in header
+    # A table of two columns measured at two load points needs saying out loud, or the
+    # reader takes the row-wise difference for the verified win.
+    assert (
+        f"Baseline column is measured at its own best load point "
+        f"(c={recipe.baseline.load_point}); tuned column at c={recipe.result.load_point}; "
+        f"the verified comparison is at c={recipe.result.load_point}."
+    ) in Path(r.outcome.report_path).read_text()
 
 
 def test_evidence_values_are_rounded_to_four_significant_digits(tmp_path: Path) -> None:
@@ -244,19 +251,22 @@ def _diagnosis(subspaces: list[str]) -> Diagnosis:
 def test_plan_filters_everything_the_model_invented(tmp_path: Path) -> None:
     """The model may propose anything; only what the engine actually offers survives.
 
-    Five priors go in -- one with an invented knob alongside a real one, one whose only
-    knob is off the categorical's menu, one the adapter rejects on this hardware, one
-    wildly out of range, and one spare -- and what comes back is the filtered remainder.
+    Four priors go in -- ``MAX_PRIORS`` is the ceiling, so a fifth would never be looked
+    at -- and each exercises one filter: an invented knob alongside a real one, two values
+    off the menu (one that is never offered, one this card is not offered), a value no
+    clamp can rescue that the adapter rejects statically, and one wildly out of range that
+    clamping saves.
     """
     plan = SearchPlanOut(
         subspaces=["decode", "not_a_subspace"],
         max_trials=9999,
         priors=[
             PriorOut(knobs={"warp_drive": 9, "kv_cache_dtype": "fp8"}, hypothesis="invented knob"),
-            PriorOut(knobs={"kv_cache_dtype": "int3"}, hypothesis="off the menu"),
-            PriorOut(knobs={"quantization": "fp8"}, hypothesis="needs cc >= 8.9"),
+            PriorOut(
+                knobs={"kv_cache_dtype": "int3", "quantization": "fp8"}, hypothesis="off the menu"
+            ),
+            PriorOut(knobs={"gpu_memory_utilization": "high"}, hypothesis="not a number"),
             PriorOut(knobs={"max_num_seqs": 10**9}, hypothesis="out of range"),
-            PriorOut(knobs={"speculative": "ngram"}, hypothesis="fine"),
         ],
     )
     logged: list[str] = []
@@ -271,8 +281,11 @@ def test_plan_filters_everything_the_model_invented(tmp_path: Path) -> None:
 
     hypotheses = [p.hypothesis for p in out.priors]
     assert "invented knob" in hypotheses  # the real half of it survived
-    assert "off the menu" not in hypotheses  # nothing left once the value was dropped
-    assert "needs cc >= 8.9" not in hypotheses  # a100-80 is compute capability 8.0
+    # int3 is on no card's menu, and fp8 quantization is off *this* one's: a100-80 is
+    # compute capability 8.0, so the knob space never offers it. Nothing is left of the
+    # prior once both go.
+    assert "off the menu" not in hypotheses
+    assert "not a number" not in hypotheses  # the adapter's static validation caught it
     kept = next(p for p in out.priors if p.hypothesis == "invented knob")
     assert "warp_drive" not in kept.config.knobs
     assert kept.config.knobs["kv_cache_dtype"] == "fp8"
@@ -286,7 +299,7 @@ def test_plan_filters_everything_the_model_invented(tmp_path: Path) -> None:
 
     log = "\n".join(logged)
     assert "dropping unknown knobs ['warp_drive']" in log
-    assert "dropping out-of-choices knobs" in log and "int3" in log
+    assert "dropping out-of-choices knobs" in log and "int3" in log and "quantization" in log
     assert "rejected statically" in log
 
 

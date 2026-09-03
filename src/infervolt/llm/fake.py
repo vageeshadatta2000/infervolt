@@ -112,13 +112,28 @@ class FakeLLMClient:
         )
 
     def _narrate(self, ctx: dict[str, Any]) -> NarrativeOut:
+        """Write the recipe's rationale from the two verified arms.
+
+        ``comparable`` is the caller's answer to "was there a baseline rate to be a
+        percentage of": both arms are driven at the candidate's load point, and a baseline
+        that OOMs or misses every deadline there scores a clean zero. There is no
+        percentage of zero, so the gain is stated in absolute rps instead. Absent, it
+        defaults to true -- a context that never mentions the question is one where the
+        comparison is ordinary.
+        """
         d, base, best = ctx["diagnosis"], ctx["baseline_metrics"], ctx["best_metrics"]
         knobs = ", ".join(f"{k}={v}" for k, v in ctx["winning_knobs"].items())
         g0, g1 = float(base.get("goodput_rps", 0)), float(best.get("goodput_rps", 0))
-        pct = (g1 - g0) / g0 * 100 if g0 else 0.0
+        if ctx.get("comparable", True):
+            pct = (g1 - g0) / g0 * 100 if g0 else 0.0
+            change = f"Changing {knobs} raised goodput from {g0:.3f} to {g1:.3f} rps ({pct:+.0f}%)."
+        else:
+            change = (
+                f"Changing {knobs} raised goodput to {g1:.3f} rps, from a baseline that "
+                f"served nothing at c={ctx.get('load_point')}."
+            )
         return NarrativeOut(
-            rationale=f"Primary bottleneck {d['primary']}: {d.get('rationale', '')} "
-            f"Changing {knobs} raised goodput from {g0:.3f} to {g1:.3f} rps ({pct:+.0f}%).",
+            rationale=f"Primary bottleneck {d['primary']}: {d.get('rationale', '')} {change}",
             next_steps=[
                 "Re-run diagnosis on the tuned config; the next bottleneck may differ.",
                 "Validate on the real engine and hardware before deploying.",

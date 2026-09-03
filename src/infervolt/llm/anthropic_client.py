@@ -36,9 +36,15 @@ def _provider_errors() -> tuple[type[BaseException], ...]:
 
 
 class AnthropicClient:
-    def __init__(self, model_id: str = "claude-opus-5", client: Any | None = None) -> None:
+    def __init__(
+        self,
+        model_id: str = "claude-opus-5",
+        client: Any | None = None,
+        api_key: str | None = None,
+    ) -> None:
         self.model_id = model_id
         self._client: Any | None = client
+        self._api_key = api_key
 
     def _sdk(self) -> Any:
         """The SDK client, built on first use.
@@ -47,11 +53,18 @@ class AnthropicClient:
         inside ``structured`` where that failure becomes an :class:`LLMError` the loop can
         degrade around -- rather than at construction, where it would kill a run that had
         every measurement it needed and only wanted prose.
+
+        ``api_key`` is only forwarded when there is one: passing ``api_key=None`` is a
+        value, and it would override the environment variable or stored profile the SDK
+        would otherwise find.
         """
         if self._client is None:
             import anthropic
 
-            self._client = anthropic.Anthropic()
+            if self._api_key is not None:
+                self._client = anthropic.Anthropic(api_key=self._api_key)
+            else:
+                self._client = anthropic.Anthropic()
         return self._client
 
     def structured(self, *, system: str, user: str, schema: type[T]) -> T:

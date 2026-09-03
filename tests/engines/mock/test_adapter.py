@@ -78,6 +78,21 @@ def test_itl_samples_have_the_modelled_mean() -> None:
     assert statistics.fmean(samples) == pytest.approx(p.itl_mean_s, rel=0.03)
 
 
+def test_quantization_choices_are_gated_on_compute_capability() -> None:
+    """A card that cannot do fp8 GEMMs is not offered fp8 quantization at all.
+
+    ``validate`` rejects it either way, but a choice that can only ever be rejected costs
+    the search a trial to learn what the hardware profile already said -- and widens the
+    space the novelty filter measures distances across.
+    """
+    adapter = MockAdapter()
+    ampere = make_context("decode", run_dir="/tmp/x")  # a100-80, compute capability 8.0
+    assert ampere.hw.compute_capability < 8.9
+    assert adapter.knob_space(ampere).get("quantization").choices == ["none"]
+    hopper = make_context("prefill", run_dir="/tmp/x")  # h100-80, compute capability 9.0
+    assert adapter.knob_space(hopper).get("quantization").choices == ["none", "fp8"]
+
+
 def test_validate_rejects_fp8_quant_on_ampere() -> None:
     adapter = MockAdapter()
     ctx = make_context("decode", run_dir="/tmp/x")  # a100, cc 8.0

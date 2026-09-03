@@ -47,6 +47,12 @@ the mean), because every rate in ``compute_metrics`` divides by ``duration_s``.
 MAX_MODEL_LEN_CHOICES: tuple[int, ...] = (4096, 8192, 16384, 32768)
 INT_KNOBS = frozenset({"max_num_seqs", "max_num_batched_tokens"})
 
+FP8_COMPUTE_CAPABILITY = 8.9
+"""Lowest compute capability with hardware fp8 GEMMs (Ada/Hopper and later).
+
+Ampere and older have no fp8 tensor cores, so ``quantization=fp8`` is not a config that
+runs slowly there -- it is one that does not run at all."""
+
 
 def _as_number(value: KnobValue) -> float | None:
     """Read a knob value as a number, or ``None`` if it is not one.
@@ -166,6 +172,14 @@ class MockAdapter(EngineAdapter):
         # and inflate the space the novelty filter measures distances across.
         min_len = self._default_max_model_len(ctx)
         len_choices = [c for c in MAX_MODEL_LEN_CHOICES if c >= min_len] or [min_len]
+        # Same argument as the lengths above, one level harder: a card with no fp8 tensor
+        # cores can never launch this config, so offering the choice only buys a rejected
+        # trial and a wider space for the novelty filter to measure across. ``validate``
+        # still refuses it -- a config can reach the adapter from a user's YAML without
+        # passing through this space at all.
+        quant_choices = ["none"]
+        if ctx.hw.compute_capability >= FP8_COMPUTE_CAPABILITY:
+            quant_choices.append("fp8")
         return KnobSpace(
             knobs=[
                 Knob(
@@ -236,7 +250,7 @@ class MockAdapter(EngineAdapter):
                     kind="cat",
                     groups=["prefill", "decode"],
                     default=d["quantization"],
-                    choices=["none", "fp8"],
+                    choices=list(quant_choices),
                 ),
             ]
         )
@@ -278,8 +292,14 @@ class MockAdapter(EngineAdapter):
                     )
             else:
                 errs.extend(self._numeric_errors(knob, value))
-        if cfg.knobs.get("quantization") == "fp8" and ctx.hw.compute_capability < 8.9:
-            errs.append("fp8 quantization needs compute capability >= 8.9")
+        # Second line of defence: ``knob_space`` already withholds the choice on a card
+        # that cannot do it, but a config can arrive from a user's YAML or a cached
+        # recipe without ever passing through the space.
+        if (
+            cfg.knobs.get("quantization") == "fp8"
+            and ctx.hw.compute_capability < FP8_COMPUTE_CAPABILITY
+        ):
+            errs.append(f"fp8 quantization needs compute capability >= {FP8_COMPUTE_CAPABILITY}")
         # Only meaningful once max_model_len is known to be one of the offered lengths;
         # the categorical check above has already reported anything else.
         max_len = cfg.knobs.get("max_model_len", MAX_MODEL_LEN_CHOICES[-1])

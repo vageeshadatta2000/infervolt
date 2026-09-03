@@ -16,8 +16,10 @@ serve:
 baseline:
   serve_args: {max_num_seqs: 256, max_num_batched_tokens: 2048, gpu_memory_utilization: 0.9, kv_cache_dtype: auto, enable_prefix_caching: true}
   metrics: {goodput_rps: 3.1, ttft_p90_ms: 812, itl_p90_ms: 27.4, output_tps: 1420}
+  load_point: 16
 result:
   metrics: {goodput_rps: 5.6, ttft_p90_ms: 430, itl_p90_ms: 24.9, output_tps: 2210}
+  load_point: 64
   repeats: 3
   improvement: {goodput_rps: "+81% (95% CI +62..+97)"}
   quality: {guard: lm-eval, tasks: [gsm8k, arc_challenge], recovery: 0.996}
@@ -32,10 +34,11 @@ infervolt:
         evidence:
           - {source: prometheus, key: preemptions_per_s, value: 2.3, unit: "/s"}
           - {source: prometheus, key: kv_usage_p95, value: 0.97}
+    caveats: []
   rationale: "Preemptions at c=16 show KV exhaustion at default 0.9 util with fp16 KV; fp8 KV doubles token capacity and removes the preemptions."
   search: {trials: 14, infeasible: 3, subspace: [gpu_memory_utilization, kv_cache_dtype, max_num_seqs, max_model_len], optimizer: optuna-tpe, seed: 7}
   trials_to_target: 6
   warm_start: {from_runs: [], notes_used: []}
   next_steps: ["Try EAGLE-3 draft: decode is now bandwidth-bound (R2 score rose to 0.7 after fix)"]
   artifacts: {report: report.md, trials: trials.jsonl}
-  provenance: {tool_version: 0.1.0, llm: claude-opus-5, prompts_sha: "0000000", created: "2026-09-03"}
+  provenance: {tool_version: 0.1.0, llm: claude-opus-5, prompts_sha: "0000000", created: "2026-09-02"}

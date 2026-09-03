@@ -50,6 +50,16 @@ def test_mock_loop_names_injected_bottleneck_and_emits_recipe(name: str, tmp_pat
         recipe = Recipe.model_validate(yaml.safe_load(Path(outcome.recipe_path).read_text()))
         assert recipe.infervolt.diagnosis.primary == s.expected
         assert recipe.result.metrics["goodput_rps"] > recipe.baseline.metrics["goodput_rps"]
+        # The narrative is written from the verified arms, both measured at the
+        # candidate's load point. `kv`'s baseline serves nothing there, so there is no
+        # rate to be a percentage of and the prose must say so in absolute terms;
+        # `decode`'s baseline does serve, so a percentage is the honest summary.
+        rationale = recipe.infervolt.rationale
+        if name == "kv":
+            assert "%" not in rationale, rationale
+            assert "served nothing" in rationale, rationale
+        elif name == "decode":
+            assert "%" in rationale, rationale
         assert "Diagnosis" in Path(outcome.report_path).read_text()
         assert outcome.trials_to_target is not None and outcome.trials_to_target >= 1
         assert len(ledger.trials(outcome.run_id)) >= 2

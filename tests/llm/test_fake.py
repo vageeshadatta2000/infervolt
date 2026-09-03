@@ -154,7 +154,30 @@ def test_fake_narrative_survives_zero_baseline_goodput() -> None:
     out = FakeLLMClient().structured(
         system=SYSTEM_PROMPT, user=render_prompt("emit", ctx), schema=NarrativeOut
     )
-    assert "+0%" in out.rationale
+    assert "+0%" in out.rationale  # ``comparable`` absent defaults to True
+
+
+def test_fake_narrative_states_absolute_rps_when_the_arms_are_not_comparable() -> None:
+    """No baseline rate means no percentage: the ratio would be to zero.
+
+    Verification drives both arms at the *candidate's* best load point, which a baseline
+    that OOMs or misses every deadline there never reaches. Printing "+inf%" -- or the
+    "+0%" a naive guard produces -- would say the opposite of what happened.
+    """
+    ctx = {
+        "diagnosis": {"primary": "kv_capacity", "rationale": "KV exhausted"},
+        "baseline_metrics": {"goodput_rps": 0.0},
+        "best_metrics": {"goodput_rps": 1.8},
+        "load_point": 64,
+        "comparable": False,
+        "winning_knobs": {"kv_cache_dtype": "fp8"},
+        "trial_ids": ["t3"],
+    }
+    out = FakeLLMClient().structured(
+        system=SYSTEM_PROMPT, user=render_prompt("emit", ctx), schema=NarrativeOut
+    )
+    assert "%" not in out.rationale
+    assert "from a baseline that served nothing at c=64" in out.rationale
 
 
 def _plan(primary: str, knob_names: list[str], current: dict[str, object]) -> SearchPlanOut:

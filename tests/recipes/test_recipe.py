@@ -4,6 +4,7 @@ import yaml
 from typer.testing import CliRunner
 
 from infervolt.cli.main import app
+from infervolt.core.types import Evidence
 from infervolt.recipes.emit import render_report, write_recipe
 from infervolt.recipes.schema import Recipe, recipe_json_schema
 
@@ -30,6 +31,24 @@ def test_report_renders_key_sections() -> None:
     md = render_report(recipe)
     assert "# infervolt recipe" in md
     assert "kv_capacity" in md and "goodput_rps" in md and "Reproduce" in md
+
+
+def test_report_renders_evidence_notes_when_a_rule_left_one() -> None:
+    """A note is the rule's own caveat about a number; dropping it loses the caveat.
+
+    ``prefix_hit_rate=0`` reads as a cold cache until the note says prefix caching was
+    off, so the note has to travel with the value into the report.
+    """
+    recipe = Recipe.model_validate(yaml.safe_load(EXAMPLE.read_text()))
+    recipe.infervolt.diagnosis.findings[0].evidence.append(
+        Evidence(source="prometheus", key="prefix_hit_rate", value=0.0, note="did not fire")
+    )
+    md = render_report(recipe)
+    assert "`prefix_hit_rate`=0 (did not fire)" in md
+    # The example's own evidence carries no notes, and an empty one must add nothing --
+    # not a trailing pair of empty parentheses.
+    assert "`kv_usage_p95`=0.97" in md
+    assert "()" not in md
 
 
 def test_report_never_prints_none_and_shows_the_goodput_target() -> None:

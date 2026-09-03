@@ -13,6 +13,13 @@ class Settings(BaseSettings):
 
     home: Path = Field(default_factory=lambda: Path.home() / ".infervolt")
     anthropic_model: str = "claude-opus-5"
+    anthropic_api_key: SecretStr | None = None
+    """Key for the Anthropic client, from ``INFERVOLT_ANTHROPIC_API_KEY``.
+
+    ``None`` is not "no key": it means infervolt has none to hand over and the SDK should
+    resolve one the way it always does -- ``ANTHROPIC_API_KEY`` or a stored profile. The
+    prefixed name exists so a user who runs several tools against several accounts can
+    point this one somewhere without moving the ambient variable."""
     openai_base_url: str = "http://localhost:8000/v1"
     openai_model: str = "default"
     openai_api_key: SecretStr = SecretStr("EMPTY")

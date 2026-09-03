@@ -14,6 +14,9 @@ Run `{{ r.infervolt.run_id }}` Â· created {{ r.infervolt.provenance.created }} Â
 **{{ k }}:** {{ v }}
 {% endfor %}
 Verified with {{ r.result.repeats }} interleaved repeats.
+{% if r.baseline.load_point is not none and r.result.load_point is not none %}
+Baseline column is measured at its own best load point (c={{ r.baseline.load_point }}); tuned column at c={{ r.result.load_point }}; the verified comparison is at c={{ r.result.load_point }}.
+{% endif %}
 {% if r.result.quality %}Quality guard `{{ r.result.quality.guard }}` on {{ r.result.quality.tasks | join(', ') }}: recovery {{ '%.3f' % r.result.quality.recovery }}.{% endif %}
 
 ## Diagnosis: {{ r.infervolt.diagnosis.primary }} (confidence {{ '%.2f' % r.infervolt.diagnosis.confidence }})
@@ -23,7 +26,7 @@ Verified with {{ r.result.repeats }} interleaved repeats.
 | Rule | Score | Evidence |
 |---|---|---|
 {% for f in r.infervolt.diagnosis.findings %}
-| {{ f.rule }} | {{ '%.2f' % f.score }} | {% for e in f.evidence %}`{{ e.key }}`={{ '%.4g' % e.value }}{{ e.unit }}{% if not loop.last %}, {% endif %}{% endfor %} |
+| {{ f.rule }} | {{ '%.2f' % f.score }} | {% for e in f.evidence %}`{{ e.key }}`={{ '%.4g' % e.value }}{{ e.unit }}{% if e.note %} ({{ e.note }}){% endif %}{% if not loop.last %}, {% endif %}{% endfor %} |
 {% endfor %}
 
 {% if r.infervolt.diagnosis.caveats %}

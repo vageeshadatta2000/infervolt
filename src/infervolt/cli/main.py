@@ -101,9 +101,20 @@ def optimize(
     home: Annotated[Path | None, typer.Option(help=HOME_HELP)] = None,
 ) -> None:
     """Run the full loop and emit a recipe."""
+    import warnings
+
+    import optuna
+
     from infervolt.agent.planner import Planner
     from infervolt.llm.factory import make_llm
     from infervolt.store.ledger import Ledger
+
+    # ``TPESampler(multivariate=True)`` is a deliberate choice, not an accident to be
+    # warned about once per call site on every run. pytest silences it through
+    # ``filterwarnings``; the CLI has no such config, and a user's first impression of the
+    # tool should not be a stack of Optuna warnings above their diagnosis. Imported here
+    # rather than at module scope so ``--version`` and ``recipe validate`` stay fast.
+    warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
 
     if llm not in LLM_NAMES:
         raise typer.BadParameter(

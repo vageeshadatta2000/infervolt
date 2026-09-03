@@ -15,7 +15,13 @@ def make_llm(name: str, settings: Settings) -> LLMClient:
     if name == "fake":
         inner = FakeLLMClient()
     elif name == "anthropic":
-        inner = AnthropicClient(model_id=settings.anthropic_model)
+        # An unset key is passed as None, so the SDK falls back to ANTHROPIC_API_KEY or a
+        # stored profile instead of authenticating as "". A blank value counts as unset:
+        # .env.example ships the line with nothing after the ``=``, and a user who copies
+        # it without filling it in means "I have not set this", not "my key is empty".
+        secret = settings.anthropic_api_key
+        key = secret.get_secret_value() if secret is not None else ""
+        inner = AnthropicClient(model_id=settings.anthropic_model, api_key=key or None)
     elif name == "openai":
         inner = OpenAICompatClient(
             model_id=settings.openai_model,

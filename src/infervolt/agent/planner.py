@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import statistics
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -393,9 +394,7 @@ class Planner:
             for k, val in best.candidate.config.knobs.items()
             if baseline.candidate.config.knobs.get(k) != val
         }
-        narrative = self._narrative(
-            diagnosis, b_metrics, c_metrics, winning, [t.id for t in trials]
-        )
+        narrative = self._narrative(diagnosis, v, winning, [t.id for t in trials])
         args, command = self.adapter.to_recipe_block(best.candidate.config, ctx)
         ver = self.adapter.version()
         w = ctx.workload
@@ -469,15 +468,29 @@ class Planner:
     def _narrative(
         self,
         diagnosis: Diagnosis,
-        b: dict[str, float],
-        c: dict[str, float],
+        v: VerifyResult,
         winning: dict[str, KnobValue],
         trial_ids: list[str],
     ) -> NarrativeOut:
+        """Ask the model for the prose, from the numbers the verification actually compared.
+
+        The summary table reports each arm at its *own* best load point, which is usually
+        not the same concurrency; the difference between those two columns is not a
+        measured delta and any percentage taken from it is fiction. Verify drove both arms
+        at one load point, so its arms are what the narrative gets -- along with
+        ``comparable``, because a baseline that served nothing there has no rate to be a
+        percentage of.
+        """
         context: dict[str, Any] = {
             "diagnosis": diagnosis.model_dump(),
-            "baseline_metrics": b,
-            "best_metrics": c,
+            "baseline_metrics": {"goodput_rps": round(v.baseline_mean, 4)},
+            "best_metrics": {
+                "goodput_rps": round(
+                    statistics.fmean(v.candidate_goodput) if v.candidate_goodput else 0.0, 4
+                )
+            },
+            "load_point": v.load_point,
+            "comparable": v.comparable,
             "winning_knobs": winning,
             "trial_ids": trial_ids,
         }
