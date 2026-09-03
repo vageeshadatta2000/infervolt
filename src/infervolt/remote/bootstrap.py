@@ -105,7 +105,10 @@ def passthrough_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     rent machines stay on the controller -- the box needs a model and an LLM key, not the
     ability to provision more of itself.
     """
-    source = os.environ if environ is None else environ
+    # A local ``.env`` (gitignored) is the documented place for keys; the process
+    # environment wins over it so a shell export still takes precedence.
+    dotenv = read_dotenv(Path.cwd() / ".env") if environ is None else {}
+    source: Mapping[str, str] = {**dotenv, **os.environ} if environ is None else environ
     out: dict[str, str] = {}
     for name, value in source.items():
         if not value:
@@ -114,6 +117,28 @@ def passthrough_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
             continue
         if name in PASSTHROUGH_NAMES or name.startswith(PASSTHROUGH_PREFIX):
             out[name] = value
+    return out
+
+
+def read_dotenv(path: Path) -> dict[str, str]:
+    """Parse ``KEY=VALUE`` lines from a dotenv file; missing file -> empty mapping.
+
+    Quotes around the value are stripped, ``export`` prefixes and ``#`` comments are
+    ignored. Values are never logged by callers; keep it that way.
+    """
+    if not path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :]
+        key, _, value = line.partition("=")
+        value = value.strip().strip("'\"")
+        if key.strip():
+            out[key.strip()] = value
     return out
 
 

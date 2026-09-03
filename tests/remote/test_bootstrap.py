@@ -196,3 +196,27 @@ def test_controller_sha_is_none_outside_a_checkout(tmp_path: Path) -> None:
     plain.mkdir()
     assert controller_sha(plain) is None
     assert controller_sha(tmp_path / "does-not-exist") is None
+
+
+def test_read_dotenv_and_passthrough_prefers_process_env(tmp_path, monkeypatch) -> None:
+    from infervolt.remote.bootstrap import passthrough_env, read_dotenv
+
+    env = tmp_path / ".env"
+    env.write_text(
+        "# keys\n"
+        'export ANTHROPIC_API_KEY="from-file"\n'
+        "HF_TOKEN=hf-x\n"
+        "INFERVOLT_THUNDER_API_TOKEN=nope\n"
+    )
+    assert read_dotenv(env) == {
+        "ANTHROPIC_API_KEY": "from-file",
+        "HF_TOKEN": "hf-x",
+        "INFERVOLT_THUNDER_API_TOKEN": "nope",
+    }
+    assert read_dotenv(tmp_path / "missing") == {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    out = passthrough_env()
+    assert out["ANTHROPIC_API_KEY"] == "from-env" and out["HF_TOKEN"] == "hf-x"
+    assert "INFERVOLT_THUNDER_API_TOKEN" not in out
