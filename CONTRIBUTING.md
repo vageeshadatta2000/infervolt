@@ -3,6 +3,8 @@
 Thanks for helping. infervolt is pre-alpha; the fastest way to contribute is to run the mock loop,
 file issues with reproductions, and send small PRs.
 
+The canonical repository URL is set at first release; until then the clone URL below is a placeholder.
+
 ## Dev setup
 
 ```bash

@@ -55,7 +55,7 @@
 | `tests/` | Mirrors `src/` layout; `tests/integration/test_mock_loop.py` is the M1 acceptance test |
 
 Conventions used in every task:
-- Run commands from `/Users/vageeshadattaganapaneni/infervolt`.
+- Run commands from the repo root.
 - `uv run pytest -q` runs all tests; `uv run ruff check . && uv run ruff format --check . && uv run mypy src` is the lint gate.
 - Commit after each task with a conventional-commit message. Do not use `git add -A`; add the files named in the task.
 
