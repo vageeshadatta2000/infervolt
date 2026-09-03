@@ -45,7 +45,9 @@ MAX_MODEL_LEN_CHOICES: tuple[int, ...] = (4096, 8192, 16384, 32768)
 
 INT_KNOBS = frozenset({"max_num_seqs", "max_num_batched_tokens"})
 
-FP8_KV_COMPUTE_CAPABILITY = 8.0
+FP8_KV_COMPUTE_CAPABILITY = (
+    9.0  # FlashAttention fp8 KV needs Hopper; Ampere silently falls back to Triton
+)
 """Ampere and later. vLLM's fp8 KV cache is a storage format, not a GEMM, so it does not
 need fp8 tensor cores -- but it does need the conversion kernels, which start at sm80."""
 
@@ -299,12 +301,6 @@ class VllmAdapter(EngineAdapter):
                     default=d["enable_prefix_caching"],
                 ),
                 Knob(
-                    name="enable_chunked_prefill",
-                    kind="bool",
-                    groups=["prefill"],
-                    default=d["enable_chunked_prefill"],
-                ),
-                Knob(
                     name="kv_cache_dtype",
                     kind="cat",
                     groups=["kv", "decode"],
@@ -513,7 +509,6 @@ class VllmAdapter(EngineAdapter):
             "127.0.0.1",
             "--port",
             str(port),
-            "--disable-log-requests",
             *self.to_args(cfg),
         ]
 
@@ -549,7 +544,6 @@ class VllmAdapter(EngineAdapter):
             "0.0.0.0",
             "--port",
             "8000",
-            "--disable-log-requests",
             *self.to_args(cfg),
         ]
 
@@ -712,5 +706,9 @@ def _default_loadgen(base_url: str, model: str) -> LoadGenerator:
     """
     from infervolt.loadgen.http import HttpLoadGenerator
 
-    gen: LoadGenerator = HttpLoadGenerator(base_url=base_url, model=model)
+    # ignore_eos pins the output length to the workload OSL; vLLM accepts it as a
+    # first-class field, so every request generates exactly max_tokens tokens.
+    gen: LoadGenerator = HttpLoadGenerator(
+        base_url=base_url, model=model, extra_body={"ignore_eos": True}
+    )
     return gen

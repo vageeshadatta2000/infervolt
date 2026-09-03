@@ -258,7 +258,8 @@ def kill_command() -> str:
     ``|| true`` because the process may already be gone -- the cap firing a second after
     the run finished is not an error worth failing the teardown for.
     """
-    return 'pkill -f "infervolt optimize" || true'
+    # The bracket keeps the pkill shell's own command line from matching the pattern.
+    return 'pkill -f "[i]nfervolt optimize" || true'
 
 
 __all__ = [

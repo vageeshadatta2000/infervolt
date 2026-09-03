@@ -137,7 +137,6 @@ def test_knob_space_mirrors_the_mock_knobs(tmp_path: Path) -> None:
         "gpu_memory_utilization",
         "max_model_len",
         "enable_prefix_caching",
-        "enable_chunked_prefill",
         "kv_cache_dtype",
         "enforce_eager",
         "speculative",
@@ -169,10 +168,13 @@ def test_fp8_choices_are_gated_on_compute_capability(tmp_path: Path) -> None:
     ada = adapter.knob_space(make_ctx(tmp_path, hardware="rtx4090-24"))  # cc 8.9
     ampere = adapter.knob_space(make_ctx(tmp_path, hardware="a100-80"))  # cc 8.0
     apple = adapter.knob_space(make_ctx(tmp_path, hardware="m3-8"))  # cc 0.0
-    assert ada.get("kv_cache_dtype").choices == ["auto", "fp8"]
+    hopper = adapter.knob_space(make_ctx(tmp_path, hardware="h100-80"))  # cc 9.0
+    # fp8 KV needs FlashAttention 3 (Hopper); on Ada/Ampere vLLM silently falls back to
+    # the slower Triton backend, so the knob is withheld there.
+    assert hopper.get("kv_cache_dtype").choices == ["auto", "fp8"]
+    assert ada.get("kv_cache_dtype").choices == ["auto"]
     assert ada.get("quantization").choices == ["none", "fp8"]
-    # Ampere stores fp8 KV but has no fp8 tensor cores for the weights.
-    assert ampere.get("kv_cache_dtype").choices == ["auto", "fp8"]
+    assert ampere.get("kv_cache_dtype").choices == ["auto"]
     assert ampere.get("quantization").choices == ["none"]
     assert apple.get("kv_cache_dtype").choices == ["auto"]
     assert apple.get("quantization").choices == ["none"]
@@ -235,7 +237,7 @@ def test_validate_rejects_fp8_weights_on_ampere(tmp_path: Path) -> None:
 
 def test_validate_rejects_fp8_kv_cache_below_ampere(tmp_path: Path) -> None:
     errs = VllmAdapter().validate(cfg_of(kv_cache_dtype="fp8"), make_ctx(tmp_path, hardware="m3-8"))
-    assert any("fp8 kv_cache_dtype needs compute capability >= 8.0" in e for e in errs)
+    assert any("fp8 kv_cache_dtype needs compute capability >= 9.0" in e for e in errs)
 
 
 def test_a_prompt_must_fit_one_batch_when_chunked_prefill_is_off(tmp_path: Path) -> None:
@@ -335,7 +337,8 @@ def test_launch_builds_the_venv_command_and_logs_it(
     handle = adapter.launch(cfg_of(max_model_len=8192), ctx)
     cmd = spawned[0].cmd
     assert cmd[:3] == ["/opt/venv/bin/vllm", "serve", "mock/qwen3-8b"]
-    assert cmd[3:8] == ["--host", "127.0.0.1", "--port", "8123", "--disable-log-requests"]
+    assert cmd[3:7] == ["--host", "127.0.0.1", "--port", "8123"]
+    assert "--disable-log-requests" not in cmd
     assert "--max-num-seqs" in cmd
     assert handle.url == "http://127.0.0.1:8123"
     log = va._state(handle).log_path

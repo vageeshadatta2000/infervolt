@@ -205,7 +205,7 @@ def test_provision_sends_the_documented_body_and_records_the_instance(tmp_path: 
 
         body = created[0]
         assert body["gpu_type"] == "a100xl" and body["num_gpus"] == 1
-        assert body["template"] == "ubuntu-22.04" and body["mode"] == "production"
+        assert body["template"] == "base" and body["mode"] == "production"
         assert body["disk_size_gb"] == 250
         # cpu_cores comes from the production spec for a100xl_x1, which offers only 15.
         assert body["cpu_cores"] == 15

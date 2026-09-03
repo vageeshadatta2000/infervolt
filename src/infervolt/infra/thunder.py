@@ -46,7 +46,7 @@ API_BASE = "https://api.thundercompute.com:8443/v1"
 USER_AGENT = f"infervolt/{__version__}"
 TNR_CONFIG = Path.home() / ".thunder" / "cli_config.json"
 SSH_USER = "ubuntu"
-DEFAULT_TEMPLATE = "ubuntu-22.04"
+DEFAULT_TEMPLATE = "base"  # live /v1/thunder-templates: base, cuda12-8, cuda12-9, ...
 DEFAULT_MODE = "production"
 
 GPU_ALIASES = {

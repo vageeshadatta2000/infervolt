@@ -79,7 +79,11 @@ _BYTES_PER_GIB = 1024**3
 
 
 def _match_nvidia(name: str, mem_gb: float) -> _Peak:
-    haystack = f"{name.upper()} {round(mem_gb)}GB"
+    # NVML reports usable memory (an "80GB" A100 shows ~79.4 GiB), so snap to the
+    # nearest marketed size before matching.
+    sizes = (16, 24, 32, 40, 48, 80, 96, 141, 192)
+    marketed = min(sizes, key=lambda s: abs(s - mem_gb))
+    haystack = f"{name.upper()} {marketed}GB"
     for needles, peak in NVIDIA_TABLE:
         if all(needle in haystack for needle in needles):
             return peak
