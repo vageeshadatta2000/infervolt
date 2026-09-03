@@ -261,8 +261,7 @@ class Planner:
 
     # ---- states
     def _prepare(self, run_id: str) -> RunContext:
-        if self.spec.hardware == "auto":
-            raise ValueError("hardware auto-detection arrives in M2; pass --hardware <profile>")
+        # ``hardware="auto"`` is resolved by get_profile, which asks the machine itself.
         return RunContext(
             run_id=run_id,
             run_dir=str(self.ledger.run_dir(run_id)),

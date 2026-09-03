@@ -27,6 +27,12 @@ dependencies = [
   "anthropic>=1.0",
   "openai>=1.40",
   "httpx>=0.27",
+  "gguf>=0.10",
+  "huggingface_hub>=0.25",
+  # Imported lazily, and only on a machine that has NVIDIA GPUs -- but it is a few
+  # hundred kilobytes of ctypes bindings, so there is nothing to gain from making the
+  # Linux path an extra the user has to remember to install.
+  "pynvml>=11",
 ]
 
 [project.urls]
