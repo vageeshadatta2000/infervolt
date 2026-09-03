@@ -14,3 +14,4 @@ htmlcov/
 runs/
 *.sqlite
 .DS_Store
+.claude/
