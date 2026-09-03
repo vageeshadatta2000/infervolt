@@ -1,0 +1,44 @@
+schema_version: 1
+model: {id: Qwen/Qwen3-8B, revision: abc123, params_b: 8.2, arch: qwen3, moe: false}
+hardware: {gpu: NVIDIA A100-SXM4-80GB, count: 1, driver: "580.65", topology: single, provider: thunder-compute}
+engine: {name: vllm, version: 0.11.0, image: "vllm/vllm-openai@sha256:deadbeef", commit: abcdef0}
+workload:
+  name: chat-4k-512
+  isl: {p50: 4096, p99: 6000}
+  osl: {p50: 512, p99: 1024}
+  prefix_share: 0.1
+  load: {mode: sweep, concurrency: [1, 4, 16, 64]}
+slo: {ttft_ms: 500, itl_ms: 30, percentile: 0.9}
+serve:
+  args: {max_num_seqs: 128, max_num_batched_tokens: 4096, gpu_memory_utilization: 0.9, kv_cache_dtype: fp8, enable_prefix_caching: true}
+  env: {}
+  command: "vllm serve Qwen/Qwen3-8B --max-num-seqs 128 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.9 --kv-cache-dtype fp8 --enable-prefix-caching"
+baseline:
+  serve_args: {max_num_seqs: 256, max_num_batched_tokens: 2048, gpu_memory_utilization: 0.9, kv_cache_dtype: auto, enable_prefix_caching: true}
+  metrics: {goodput_rps: 3.1, ttft_p90_ms: 812, itl_p90_ms: 27.4, output_tps: 1420}
+  load_point: 16
+result:
+  metrics: {goodput_rps: 5.6, ttft_p90_ms: 430, itl_p90_ms: 24.9, output_tps: 2210}
+  load_point: 64
+  repeats: 3
+  improvement: {goodput_rps: "+81% (95% CI +62..+97)"}
+  quality: {guard: lm-eval, tasks: [gsm8k, arc_challenge], recovery: 0.996}
+infervolt:
+  run_id: 2026-09-03T14-02-11Z-7f3a
+  diagnosis:
+    primary: kv_capacity
+    confidence: 0.82
+    findings:
+      - rule: R1
+        score: 0.9
+        evidence:
+          - {source: prometheus, key: preemptions_per_s, value: 2.3, unit: "/s"}
+          - {source: prometheus, key: kv_usage_p95, value: 0.97}
+    caveats: []
+  rationale: "Preemptions at c=16 show KV exhaustion at default 0.9 util with fp16 KV; fp8 KV doubles token capacity and removes the preemptions."
+  search: {trials: 14, infeasible: 3, subspace: [gpu_memory_utilization, kv_cache_dtype, max_num_seqs, max_model_len], optimizer: optuna-tpe, seed: 7}
+  trials_to_target: 6
+  warm_start: {from_runs: [], notes_used: []}
+  next_steps: ["Try EAGLE-3 draft: decode is now bandwidth-bound (R2 score rose to 0.7 after fix)"]
+  artifacts: {report: report.md, trials: trials.jsonl}
+  provenance: {tool_version: 0.1.0, llm: claude-opus-5, prompts_sha: "0000000", created: "2026-09-02"}

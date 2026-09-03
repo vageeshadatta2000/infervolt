@@ -1,0 +1,39 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+# Read-only by default: nothing in this workflow writes to the repository, and a token
+# scoped to what the job actually needs cannot be turned into one by a compromised action.
+permissions: { contents: read }
+# A push that supersedes an in-flight run makes that run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    # uv reads this for every `uv run`/`uv sync`, so the matrix entry -- not whatever
+    # interpreter the runner image happens to ship -- is the one the tests run on.
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with: { enable-cache: true }
+      - run: uv python install ${{ matrix.python }}
+      # --locked fails rather than silently resolving something new: CI must test the
+      # dependency set the lockfile pins, or a green run says nothing about what ships.
+      - run: uv sync --locked --extra dev
+      - run: uv run ruff check . && uv run ruff format --check .
+      - run: uv run mypy src
+      - run: uv run pytest -q --cov=infervolt --cov-report=term-missing
+      # The sdist and wheel are the artifacts users install; a packaging mistake that only
+      # shows up at release time is one nobody is watching for.
+      - run: uv build
+      - name: Validate committed recipes
+        run: |
+          for f in $(find recipes examples -name 'recipe.yaml' 2>/dev/null); do uv run infervolt recipe validate "$f"; done

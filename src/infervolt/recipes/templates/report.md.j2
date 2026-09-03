@@ -1,0 +1,81 @@
+# infervolt recipe: {{ r.model.id }} on {{ r.hardware.gpu }} ({{ r.engine.name }})
+
+Run `{{ r.infervolt.run_id }}` · created {{ r.infervolt.provenance.created }} · infervolt {{ r.infervolt.provenance.tool_version }}
+
+## Summary
+
+| Metric | Baseline{% if r.baseline.load_point is not none %} (c={{ r.baseline.load_point }}){% endif %} | Tuned{% if r.result.load_point is not none %} (c={{ r.result.load_point }}){% endif %} |
+|---|---|---|
+{% for k, v in r.result.metrics.items() %}
+| {{ k }} | {{ '%.3f' % r.baseline.metrics.get(k, 0.0) }} | {{ '%.3f' % v }} |
+{% endfor %}
+
+{% for k, v in r.result.improvement.items() %}
+**{{ k }}:** {{ v }}
+{% endfor %}
+Verified with {{ r.result.repeats }} interleaved repeats.
+{% if r.baseline.load_point is not none and r.result.load_point is not none %}
+Baseline column is measured at its own best load point (c={{ r.baseline.load_point }}); tuned column at c={{ r.result.load_point }}; the verified comparison is at c={{ r.result.load_point }}.
+{% endif %}
+{% if r.result.quality %}Quality guard `{{ r.result.quality.guard }}` on {{ r.result.quality.tasks | join(', ') }}: recovery {{ '%.3f' % r.result.quality.recovery }}.{% endif %}
+
+## Diagnosis: {{ r.infervolt.diagnosis.primary }} (confidence {{ '%.2f' % r.infervolt.diagnosis.confidence }})
+
+{{ r.infervolt.rationale }}
+
+| Rule | Score | Evidence |
+|---|---|---|
+{% for f in r.infervolt.diagnosis.findings %}
+| {{ f.rule }} | {{ '%.2f' % f.score }} | {% for e in f.evidence %}`{{ e.key }}`={{ '%.4g' % e.value }}{{ e.unit }}{% if e.note %} ({{ e.note }}){% endif %}{% if not loop.last %}, {% endif %}{% endfor %} |
+{% endfor %}
+
+{% if r.infervolt.diagnosis.caveats %}
+Caveats from diagnosis:
+
+{% for c in r.infervolt.diagnosis.caveats %}
+- {{ c }}
+{% endfor %}
+{% endif %}
+
+## Winning configuration
+
+| Knob | Baseline | Tuned |
+|---|---|---|
+{% for k, v in r.serve.args.items() %}
+| {{ k }} | {{ r.baseline.serve_args.get(k, '') | yamlish }} | {{ v | yamlish }} |
+{% endfor %}
+
+## Search
+
+{{ r.infervolt.search.trials }} trials ({{ r.infervolt.search.infeasible }} infeasible) with {{ r.infervolt.search.optimizer }} over {{ r.infervolt.search.subspace | join(', ') }}, seed {{ r.infervolt.search.seed }}.
+{% if r.infervolt.trials_to_target is not none %}Trials to reach 95% of the final best: {{ r.infervolt.trials_to_target }}.{% endif %}
+
+## Workload and SLO
+
+`{{ r.workload.name }}`: ISL p50 {{ r.workload.isl.p50 }}, OSL p50 {{ r.workload.osl.p50 }}, prefix share {{ r.workload.prefix_share }}.
+{% set parts = [] %}
+{% if r.slo.ttft_ms is not none %}{% set _ = parts.append('ttft %s ms' % r.slo.ttft_ms) %}{% endif %}
+{% if r.slo.itl_ms is not none %}{% set _ = parts.append('itl %s ms' % r.slo.itl_ms) %}{% endif %}
+{% if r.slo.e2e_ms is not none %}{% set _ = parts.append('e2e %s ms' % r.slo.e2e_ms) %}{% endif %}
+{% if parts %}
+SLO: {{ parts | join(', ') }} at p{{ (r.slo.percentile * 100) | int }}, goodput target {{ r.slo.goodput_target }}.
+{% else %}
+SLO: none (throughput only), goodput target {{ r.slo.goodput_target }}.
+{% endif %}
+
+## Reproduce
+
+```bash
+{{ r.serve.command }}
+```
+
+## Next steps
+
+{% for s in r.infervolt.next_steps %}
+- {{ s }}
+{% endfor %}
+
+## Caveats
+
+- Measurements come from a synthetic or real load generator as recorded in `artifacts`; GPUs are not bit-reproducible, expect a few percent variance.
+- Provenance: llm `{{ r.infervolt.provenance.llm }}`, prompts `{{ r.infervolt.provenance.prompts_sha }}`.

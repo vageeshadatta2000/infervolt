@@ -1,0 +1,11 @@
+Plan a targeted configuration search for the diagnosed bottleneck.
+
+Pick the sub-spaces (groups) worth searching, propose up to 4 prior candidates as knob dicts using
+ONLY knob names from `knob_space` with values inside their bounds/choices, give each a one-line
+hypothesis, and set max_trials <= budget.max_trials. Prefer changes that attack the primary
+bottleneck; keep the search narrow. Output schema: {"subspaces", "priors": [{"knobs", "hypothesis"}],
+"max_trials", "rationale"}.
+
+<context>
+{{ context_json }}
+</context>
